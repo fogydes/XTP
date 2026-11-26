@@ -759,6 +759,38 @@ fn rt_tlas_of_no_instance_or_of_unknown_blas_misses() {
     assert_eq!(outs[2].words(), hit(), "the known instance after it");
 }
 
+#[test]
+fn rt_translated_instance_moves_the_hit_to_its_translation() {
+    let test = "rt_translated_instance_moves_the_hit_to_its_translation";
+    let Some((gpu, rays)) = dxr(test) else {
+        return;
+    };
+    let world = World::new();
+    let instances = instances_of(&[world.blas.address()]);
+    let mut words = instances.words();
+    words[3] = 4f32.to_bits();
+    instances.set_words(|i| words[i]);
+    let tlas = TitleBuffer::new(1024);
+    let build = TitleList::new();
+    // SAFETY: the title list and instance buffer are live.
+    unsafe { assert!(Builder.build(build.this(), &tlas_desc(tlas.address(), &instances))) };
+    build.run();
+    if !rays {
+        return;
+    }
+
+    let slot = Descriptor::new(tlas.address());
+    let out = unwritten();
+    let list = TitleList::new();
+    trace(gpu.host(), &list, Scene::Descriptor(slot.handle()), &out);
+    list.run();
+    assert_eq!(
+        out.words(),
+        [0, 0, 1, 2.0f32.to_bits()],
+        "the instance misses at x=0 and hits at its translated x=4"
+    );
+}
+
 /// A trace recorded before the title releases its TLAS's buffer, and
 /// submitted after, misses: the release empties the slot the trace binds
 /// at submission (the old TLAS stayed alive in it and was hit).
