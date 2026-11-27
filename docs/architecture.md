@@ -136,6 +136,16 @@ of apparent target availability: census neither follows nor loads them and
 does not claim native binding parity. They contribute to totals but not
 resolved or missing counts.
 
+## Descriptor heap sync
+
+With `XTP_HEAP_SYNC=1`, the submitter waits for in-flight work that could
+still read the shader-visible heaps, then starts a mirror round. Between
+submissions the worker can collect write-watch changes without touching D3D12
+descriptors. The requested round mirrors the latest snapshots in parallel.
+Submission waits for it before any picked-view sweeps and before sending
+lists to the queue. Copied views feed the same buffer listing and texture
+queue used by API-written descriptors.
+
 ## Shaders
 
 `xtp_shader::ir::build` turns a native program into SSA, one

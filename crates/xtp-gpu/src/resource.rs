@@ -911,7 +911,8 @@ impl Drop for HostTexture {
 /// The host copy of `this`, if it has one the GPU may use now.
 #[cfg(windows)]
 fn ready_host(this: This) -> Option<&'static std::sync::Arc<HostTexture>> {
-    // SAFETY: called from resource methods only, while the title holds it.
+    // SAFETY: callers keep the resource alive while using the host copy.
+    // The background descriptor mirror acquires a reference from VIEWS.
     let r = unsafe { &*this.cast::<Resource>() };
     r.host.as_ref().filter(|h| h.ready())
 }
@@ -1709,7 +1710,6 @@ impl Drop for Resource {
             }
         }
         crate::texture::forget(std::ptr::from_ref::<Resource>(self) as usize);
-        crate::descriptor::forget(std::ptr::from_ref::<Resource>(self) as usize);
         if self.desc.dimension == BUFFER {
             crate::shadow::unregister(
                 std::ptr::from_ref::<Resource>(self) as usize,
@@ -3437,8 +3437,8 @@ extern "system" fn resource_query(this: This, iid: *const Iid, out: *mut This) -
         out,
     )
 }
-extern "system" fn resource_release(this: This) -> u32 {
-    object::release_boxed::<Resource>(this)
+pub(crate) extern "system" fn resource_release(this: This) -> u32 {
+    object::release_boxed_with::<Resource>(this, || crate::descriptor::forget(this as usize))
 }
 /// Memory is always mapped (subresources are not told apart yet); a null
 /// `out` only asks for residency.

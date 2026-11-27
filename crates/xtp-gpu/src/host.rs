@@ -641,6 +641,23 @@ mod tests {
     use super::*;
 
     #[test]
+    fn submission_callbacks_run_after_the_heap_sync_join() {
+        let Some(gpu) = crate::testgpu::device(
+            "host::tests::submission_callbacks_run_after_the_heap_sync_join",
+        ) else {
+            return;
+        };
+        let list = gpu.host().new_list().unwrap();
+        list.submitting(|| panic!("a list without callbacks does not need an early join"));
+
+        let joined = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let observed = joined.clone();
+        list.at_submit(move |_| assert!(observed.load(Ordering::Acquire)));
+        list.submitting(|| joined.store(true, Ordering::Release));
+        assert!(joined.load(Ordering::Acquire));
+    }
+
+    #[test]
     fn fills_merge_only_across_contiguous_bytes_of_one_upload() {
         let Some(gpu) =
             crate::testgpu::device("fills_merge_only_across_contiguous_bytes_of_one_upload")
@@ -1853,13 +1870,17 @@ impl Host {
         if batch.submission.is_multiple_of(32) {
             crate::readmap::save_copy_back_map();
         }
-        // Records the title copied into its placed descriptor heaps as
-        // bytes, before the lists' own work at submission (their sweeps).
-        if is_title {
-            crate::descriptor::sync_heaps();
-        }
+        // In-flight lists may still read the shader-visible slots we are
+        // about to rewrite. The submission lock excludes new executions
+        // while the mirror runs. The disabled path does not drain.
+        let mut heaps_synced =
+            is_title.then(|| crate::descriptor::begin_sync_heaps(|| self.drain()));
         for list in runs {
-            list.submitting();
+            list.submitting(|| {
+                if let Some(sync) = heaps_synced.take() {
+                    sync.finish();
+                }
+            });
             list.run_deferred(&mut batch);
             firsts.push(lists.len());
             // Copies of textures the title wrote after the list read them,
@@ -1891,6 +1912,12 @@ impl Host {
         }
         lists.extend(cards_last.map(Some));
         let (mut pending, touches) = Pending::of(runs, batch.submission);
+        // Wait for the background descriptor heap sync before sending the
+        // command lists to the GPU (counted in preparing if it was not
+        // finished yet).
+        if let Some(sync) = heaps_synced {
+            sync.finish();
+        }
         // Preparing, without the waits for earlier submissions (counted as
         // waiting).
         let waited_now = waited_here();
@@ -3001,8 +3028,13 @@ impl HostList {
 
     /// Runs what the recording asked to run at each submission
     /// ([`HostList::at_submit`]), the list's lock let go meanwhile.
-    fn submitting(&self) {
+    fn submitting(&self, before: impl FnOnce()) {
         let work = self.deferred().submitting.clone();
+        // Picked-view sweeps and their deferred refreshes need the listing
+        // published by the mirror. The list's lock is free before waiting.
+        if !work.is_empty() {
+            before();
+        }
         for work in work {
             work(self);
         }

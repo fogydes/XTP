@@ -5,6 +5,10 @@
 //! image and sampler descriptors, so a title that copies descriptors itself
 //! moves whole ones. Render target and depth views are ours alone; 128 bytes
 //! leaves room for whatever stride a title assumes.
+//!
+//! Optional heap sync reads copied records from dirty pages into snapshots.
+//! Its background worker can scan ahead. Only submission rounds mirror the
+//! snapshots to D3D12, with heap and view lifetimes held through the update.
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 use crate::object::{self, DESCRIPTOR_HEAP, E_INVALIDARG, HRESULT, Iid, Object, Table, This, guid};
@@ -291,7 +295,7 @@ fn heap_sync() -> &'static xtp_core::ab::Switch<bool> {
 #[cfg(windows)]
 fn heap_sync_used() -> bool {
     use xtp_core::ab::Arm;
-    cfg!(test) || heap_sync().at(Arm::A) || heap_sync().at(Arm::B)
+    heap_sync().at(Arm::A) || heap_sync().at(Arm::B)
 }
 
 /// A placed shader-visible heap's part in the look for the records the
@@ -352,10 +356,10 @@ struct Watched {
     /// of 7c64b95), with every slot of that read, and the read reached into
     /// the next block for the slot across their boundary.
     unread: std::collections::BTreeSet<usize>,
+    /// Changes observed between submissions, coalesced by slot.
+    pending: std::collections::BTreeMap<u32, u64>,
     /// Looks so far.
     looks: u64,
-    /// Room for the records of a changed page.
-    bytes: Vec<u8>,
 }
 
 /// Looks after which the blocks of a placed heap that no write watch
@@ -450,9 +454,10 @@ impl Copies {
 }
 
 /// Since the last frame line's count ([`take_synced`]): what
-/// [`sync_heaps`] found, and the microseconds it took.
+/// [`sync_heaps`] found, the microseconds it took, and the microseconds
+/// submissions waited for the background thread ([`SyncedHeaps`]).
 #[cfg(windows)]
-static SYNCED: std::sync::Mutex<(Copies, u64)> = std::sync::Mutex::new((
+static SYNCED: std::sync::Mutex<(Copies, u64, u64)> = std::sync::Mutex::new((
     Copies {
         pages: 0,
         slots: 0,
@@ -469,12 +474,353 @@ static SYNCED: std::sync::Mutex<(Copies, u64)> = std::sync::Mutex::new((
         unwatched: 0,
     },
     0,
+    0,
 ));
+
+/// Whether a submission's [`sync_heaps`] runs on a thread of its own beside
+/// the rest of submission preparation (`XTP_HEAP_SYNC_ASIDE=0`: inline on
+/// the submitting thread, as before). On by default whenever `XTP_HEAP_SYNC`
+/// is active.
+#[cfg(windows)]
+fn sync_aside() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("XTP_HEAP_SYNC_ASIDE").is_none_or(|v| v != "0"))
+}
+
+/// How long the `xtp-heap-sync` thread waits between submissions before
+/// scanning dirty pages (`XTP_HEAP_SYNC_EARLY=<ms>`, 4 by default, 0 off).
+/// Only a requested round writes host descriptors after the submitter
+/// drains in-flight work. The worker stops polling after 500 ms idle.
+#[cfg(windows)]
+fn sync_early() -> Option<std::time::Duration> {
+    static EVERY: std::sync::OnceLock<Option<std::time::Duration>> = std::sync::OnceLock::new();
+    *EVERY.get_or_init(|| {
+        let ms = std::env::var("XTP_HEAP_SYNC_EARLY")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(4u64);
+        (ms > 0).then(|| std::time::Duration::from_millis(ms))
+    })
+}
+
+/// Worker threads used by parallel [`sync_heaps`] (`XTP_HEAP_SYNC_THREADS`,
+/// 6 by default including the calling thread, clamped to `1..=16`; `1` runs
+/// single-threaded).
+#[cfg(windows)]
+fn sync_threads() -> usize {
+    static THREADS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *THREADS.get_or_init(|| {
+        std::env::var("XTP_HEAP_SYNC_THREADS")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(6usize)
+            .clamp(1, 16)
+    })
+}
+
+/// Reusable scoped worker pool for parallel descriptor heap sync.
+#[cfg(windows)]
+struct SyncPool {
+    state: std::sync::Mutex<SyncPoolState>,
+    more: std::sync::Condvar,
+    idle: std::sync::Condvar,
+    /// One batch at a time.
+    turn: std::sync::Mutex<()>,
+    threads: usize,
+}
+
+#[cfg(windows)]
+#[derive(Default)]
+struct SyncPoolState {
+    work: Option<SyncWork>,
+    next: usize,
+    count: usize,
+    running: usize,
+    panicked: bool,
+}
+
+#[cfg(windows)]
+#[derive(Clone, Copy)]
+struct SyncWork(*const (dyn Fn(usize) + Sync));
+
+// SAFETY: the closure is `Sync` so it may be called concurrently from any
+// worker thread, and `SyncPool::each` keeps it alive until `state.work` is
+// cleared and `state.running == 0` (enforced by a `Drop` guard on unwind).
+#[cfg(windows)]
+unsafe impl Send for SyncWork {}
+
+#[cfg(windows)]
+impl SyncPool {
+    fn state(&self) -> std::sync::MutexGuard<'_, SyncPoolState> {
+        self.state.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn take(state: &mut SyncPoolState) -> Option<(SyncWork, usize)> {
+        let work = state.work?;
+        if state.next >= state.count {
+            return None;
+        }
+        let i = state.next;
+        state.next += 1;
+        Some((work, i))
+    }
+
+    fn empty(threads: usize) -> Self {
+        SyncPool {
+            state: std::sync::Mutex::default(),
+            more: std::sync::Condvar::new(),
+            idle: std::sync::Condvar::new(),
+            turn: std::sync::Mutex::new(()),
+            threads,
+        }
+    }
+
+    fn new(threads: usize) -> &'static SyncPool {
+        let pool: &'static SyncPool = Box::leak(Box::new(Self::empty(threads)));
+        for i in 1..threads {
+            let _ = std::thread::Builder::new()
+                .name(format!("xtp-heap-sync-{i}"))
+                .spawn(move || pool.help());
+        }
+        pool
+    }
+
+    fn help(&self) {
+        let mut state = self.state();
+        loop {
+            let Some((work, i)) = Self::take(&mut state) else {
+                state = self.more.wait(state).unwrap_or_else(|e| e.into_inner());
+                continue;
+            };
+            state.running += 1;
+            drop(state);
+            // SAFETY: this thread is counted in `state.running`, so
+            // `SyncPool::each` has not returned and `work.0` is still valid.
+            let ran =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe { (*work.0)(i) }));
+            state = self.state();
+            state.running -= 1;
+            state.panicked |= ran.is_err();
+            if state.running == 0 {
+                self.idle.notify_all();
+            }
+        }
+    }
+
+    /// Calls `f` with `0..count` across the pool's threads and this thread,
+    /// returning once every call has finished.
+    fn each(&self, count: usize, f: &(dyn Fn(usize) + Sync)) {
+        if count < 2 || self.threads < 2 {
+            (0..count).for_each(f);
+            return;
+        }
+        let _turn = self.turn.lock().unwrap_or_else(|e| e.into_inner());
+        // SAFETY: the lifetime is erased only for the duration of this call;
+        // `Finish`'s drop guard clears `state.work` and waits until
+        // `state.running == 0` before `each` can return or unwind.
+        let work = SyncWork(unsafe {
+            std::mem::transmute::<
+                *const (dyn Fn(usize) + Sync + '_),
+                *const (dyn Fn(usize) + Sync + 'static),
+            >(f)
+        });
+        struct Finish<'a>(&'a SyncPool);
+        impl Drop for Finish<'_> {
+            fn drop(&mut self) {
+                let mut state = self.0.state();
+                state.work = None;
+                while state.running > 0 {
+                    state = self.0.idle.wait(state).unwrap_or_else(|e| e.into_inner());
+                }
+            }
+        }
+        {
+            let mut state = self.state();
+            (state.work, state.next, state.count, state.panicked) = (Some(work), 0, count, false);
+        }
+        let finish = Finish(self);
+        if count > self.threads {
+            self.more.notify_all();
+        } else {
+            for _ in 1..count {
+                self.more.notify_one();
+            }
+        }
+        let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            loop {
+                let next = Self::take(&mut self.state());
+                let Some((_, i)) = next else { break };
+                f(i);
+            }
+        }));
+        drop(finish);
+        let panicked = self.state().panicked;
+        if let Err(panic) = ran {
+            std::panic::resume_unwind(panic);
+        }
+        assert!(!panicked, "a heap sync worker panicked");
+    }
+}
+
+/// Runs `f` over `0..count` on the descriptor heap sync worker pool.
+#[cfg(windows)]
+fn each_sync(count: usize, f: &(dyn Fn(usize) + Sync)) {
+    if count < 2 {
+        (0..count).for_each(f);
+        return;
+    }
+    static POOL: std::sync::OnceLock<&'static SyncPool> = std::sync::OnceLock::new();
+    POOL.get_or_init(|| SyncPool::new(sync_threads()))
+        .each(count, f);
+}
+
+/// The `xtp-heap-sync` thread's state: rounds requested, rounds completed,
+/// and whether a scan or mirror panicked. A partial pass can consume notes
+/// and dirty bits, so a failed worker cannot approve later submissions.
+#[cfg(windows)]
+static SYNC_ROUNDS: (std::sync::Mutex<(u64, u64, bool)>, std::sync::Condvar) = (
+    std::sync::Mutex::new((0, 0, false)),
+    std::sync::Condvar::new(),
+);
+
+/// A [`sync_heaps`] round in flight on `xtp-heap-sync`; joined when dropped
+/// (before `ExecuteCommandLists`). Holds `None` when sync is off or ran
+/// inline.
+#[cfg(windows)]
+pub(crate) struct SyncedHeaps(Option<u64>);
+
+/// Starts a [`sync_heaps`] round for a submission: off-thread on
+/// `xtp-heap-sync` when `XTP_HEAP_SYNC_ASIDE` is on (the default), inline
+/// when `XTP_HEAP_SYNC_ASIDE=0`, or a no-op when `XTP_HEAP_SYNC` is off.
+#[cfg(windows)]
+pub(crate) fn begin_sync_heaps(before_mirroring: impl FnOnce()) -> SyncedHeaps {
+    if !heap_sync().get() {
+        return SyncedHeaps(None);
+    }
+    before_mirroring();
+    begin_sync_heaps_inner()
+}
+
+#[cfg(windows)]
+fn begin_sync_heaps_inner() -> SyncedHeaps {
+    if !sync_aside() {
+        sync_heaps(false);
+        return SyncedHeaps(None);
+    }
+    static STARTED: std::sync::Once = std::sync::Once::new();
+    static THREAD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    STARTED.call_once(|| {
+        let made = std::thread::Builder::new()
+            .name("xtp-heap-sync".into())
+            .spawn(|| {
+                let rounds = || SYNC_ROUNDS.0.lock().unwrap_or_else(|e| e.into_inner());
+
+                let mut last = std::time::Instant::now();
+                loop {
+                    let mut r = rounds();
+                    let mut asked = r.0 != r.1;
+                    while !asked {
+                        let remaining =
+                            std::time::Duration::from_millis(500).saturating_sub(last.elapsed());
+                        let Some(every) = sync_early()
+                            .filter(|_| !r.2 && !remaining.is_zero() && heap_sync().get())
+                            .map(|every| every.min(remaining))
+                        else {
+                            r = SYNC_ROUNDS.1.wait(r).unwrap_or_else(|e| e.into_inner());
+                            asked = r.0 != r.1;
+                            continue;
+                        };
+                        let (back, over) = SYNC_ROUNDS
+                            .1
+                            .wait_timeout(r, every)
+                            .unwrap_or_else(|e| e.into_inner());
+                        r = back;
+                        asked = r.0 != r.1;
+                        if over.timed_out() {
+                            break;
+                        }
+                    }
+                    let already_failed = r.2;
+                    drop(r);
+                    if asked {
+                        last = std::time::Instant::now();
+                        let failed = already_failed
+                            || std::panic::catch_unwind(|| sync_heaps(false)).is_err();
+                        let mut r = rounds();
+                        r.1 += 1;
+                        r.2 = failed;
+                        SYNC_ROUNDS.1.notify_all();
+                    } else if !already_failed
+                        && heap_sync().get()
+                        && std::panic::catch_unwind(|| sync_heaps(true)).is_err()
+                    {
+                        rounds().2 = true;
+                        tracing::error!("early descriptor heap scan failed");
+                    }
+                }
+            });
+        THREAD.store(made.is_ok(), std::sync::atomic::Ordering::Release);
+    });
+    if !THREAD.load(std::sync::atomic::Ordering::Acquire) {
+        tracing::warn!("could not start the descriptor heap sync thread, running inline");
+        sync_heaps(false);
+        return SyncedHeaps(None);
+    }
+    let mut rounds = SYNC_ROUNDS.0.lock().unwrap_or_else(|e| e.into_inner());
+    rounds.0 += 1;
+    let mine = rounds.0;
+    drop(rounds);
+    SYNC_ROUNDS.1.notify_all();
+    SyncedHeaps(Some(mine))
+}
+
+#[cfg(windows)]
+impl SyncedHeaps {
+    /// Waits for a successful mirror before the submission can use it.
+    pub(crate) fn finish(mut self) {
+        assert!(self.wait(), "descriptor heap sync failed");
+    }
+
+    fn wait(&mut self) -> bool {
+        let Some(mine) = self.0.take() else {
+            return true;
+        };
+        let began = std::time::Instant::now();
+        let mut rounds = SYNC_ROUNDS.0.lock().unwrap_or_else(|e| e.into_inner());
+        while rounds.1 < mine {
+            rounds = SYNC_ROUNDS
+                .1
+                .wait(rounds)
+                .unwrap_or_else(|e| e.into_inner());
+        }
+        let succeeded = !rounds.2;
+        drop(rounds);
+        SYNCED.lock().unwrap_or_else(|e| e.into_inner()).2 += began.elapsed().as_micros() as u64;
+        succeeded
+    }
+}
+
+#[cfg(windows)]
+impl Drop for SyncedHeaps {
+    fn drop(&mut self) {
+        // Join during unwinding as well, without starting a second panic.
+        self.wait();
+    }
+}
 
 /// Heaps the tests look at themselves ([`Heap::look_for_copies`]), which
 /// [`sync_heaps`] on other tests' threads leaves alone.
 #[cfg(all(test, windows))]
 static LOOKED_AT_BY_TESTS: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
+
+#[cfg(all(test, windows))]
+struct BeforeLook {
+    heap: usize,
+    pause: Box<dyn FnOnce() + Send>,
+}
+
+#[cfg(all(test, windows))]
+static BEFORE_LOOK: std::sync::Mutex<Option<BeforeLook>> = std::sync::Mutex::new(None);
 
 /// Mirrors the descriptor records the title copied into its placed
 /// shader-visible heaps as bytes (stores or memcpy, which no `Create*View`
@@ -514,18 +860,13 @@ static LOOKED_AT_BY_TESTS: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(
 /// - slots a read could not reach are read in smaller pieces, and those
 ///   still unread are looked at again ([`Watched::unread`]).
 ///
-/// shortcut: the mirror reads each record again in place, as a call's
-/// does, after the look read it through the kernel: a page the title
-/// unmapped between the two would fault. A record the title is copying
-/// while a look reads it may be found torn once: it is mirrored as the
-/// slot holds it then, and the whole one at the next look.
+/// The mirror consumes kernel-read keys without rereading title memory
+/// directly. API writes supersede captured keys under RECORDS. A raw
+/// store racing the scan may be observed on the next write-watch poll.
 /// With `XTP_HEAP_SYNC=1`, or `ab` in turns ([`heap_sync`]); off, nothing is
 /// looked at.
 #[cfg(windows)]
-pub(crate) fn sync_heaps() {
-    if !heap_sync().get() {
-        return;
-    }
+fn sync_heaps(scan_only: bool) {
     let started = std::time::Instant::now();
     // Held, not the registry's lock: a heap's release waits for its look,
     // and a heap made since at the same address is another.
@@ -540,7 +881,24 @@ pub(crate) fn sync_heaps() {
     let holds = registered(|_| true);
     let mut found = Copies::default();
     for (_, hold) in holds {
-        hold.with(|heap| heap.look_for_copies(&mut found));
+        hold.with(|heap| {
+            #[cfg(test)]
+            {
+                let pause = {
+                    let mut hook = BEFORE_LOOK.lock().unwrap_or_else(|e| e.into_inner());
+                    let address = std::ptr::from_ref(heap) as usize;
+                    if hook.as_ref().is_some_and(|hook| hook.heap == address) {
+                        hook.take()
+                    } else {
+                        None
+                    }
+                };
+                if let Some(hook) = pause {
+                    (hook.pause)();
+                }
+            }
+            heap.look_for_copies(&mut found, scan_only);
+        });
     }
     let mut synced = SYNCED.lock().unwrap_or_else(|e| e.into_inner());
     synced.0.add(&found);
@@ -554,7 +912,13 @@ pub(crate) fn sync_heaps() {
 fn page_slots(page: usize, start: usize, step: usize, count: usize) -> std::ops::Range<usize> {
     use crate::watch::PAGE;
     let end = start + count * step;
-    let (from, to) = ((page * PAGE).max(start), ((page + 1) * PAGE).min(end));
+    let Some(page_start) = page.checked_mul(PAGE) else {
+        return 0..0;
+    };
+    let (from, to) = (
+        page_start.max(start),
+        page_start.saturating_add(PAGE).min(end),
+    );
     if from >= to {
         return 0..0;
     }
@@ -629,23 +993,40 @@ fn kernel_pieces(start: usize, step: usize, slots: Range<usize>) -> Vec<Range<us
     pieces
 }
 
-/// Of slots `slots` of a placed heap from `start` (`step` bytes each),
-/// those whose record is not the one noted there ([`Watch::noted`]), each
-/// with its record's key, noted now. Slots and notes are read in one read
-/// of [`RECORDS`], so no call writes a record and its note meanwhile. A
-/// read that fails (some of the memory not mapped) is made again in
-/// [`kernel_pieces`], and the slots no piece reaches are left to the next
-/// look ([`Watched::unread`]).
+/// Pages [`Heap::look_for_copies`] gives a worker thread at a time.
 #[cfg(windows)]
-fn changed_slots(
+const SYNC_PAGES: usize = 8;
+
+/// Records [`Heap::look_for_copies`] gives a worker thread at a time.
+#[cfg(windows)]
+const SYNC_AT_A_TIME: usize = 256;
+
+/// What one worker chunk found on its pages of a heap during
+/// [`Heap::look_for_copies`].
+#[cfg(windows)]
+#[derive(Default)]
+struct SyncPart {
+    found: Copies,
+    unread: Vec<usize>,
+    changed: Vec<(u32, u64)>,
+}
+
+/// Of slots `slots` of a placed heap from `start` (`step` bytes each),
+/// appends those whose record is not the one noted there ([`Watch::noted`])
+/// into `part.changed`, noting them now using [`host::changed_records`]'s
+/// 16-record fast skip. Slots and notes are read in one shared read of
+/// [`RECORDS`], so no call writes a record and its note meanwhile. A read
+/// that fails (some of the memory not mapped) is retried in
+/// [`kernel_pieces`], and unreadable slots are left to the next look
+/// ([`Watched::unread`]).
+#[cfg(windows)]
+fn changed_slots_into(
     watch: &Watch,
-    w: &mut Watched,
+    bytes: &mut Vec<u8>,
     (start, step): (usize, usize),
     slots: Range<usize>,
-    found: &mut Copies,
-) -> Vec<(u32, u64)> {
-    use std::sync::atomic::Ordering::Relaxed;
-    let Watched { bytes, unread, .. } = w;
+    part: &mut SyncPart,
+) {
     bytes.resize(slots.len() * step, 0);
     let at = |slot: usize| start + slot * step;
     let into = |bytes: &mut Vec<u8>, piece: &Range<usize>| {
@@ -653,38 +1034,42 @@ fn changed_slots(
         crate::host::read_into(at(piece.start) as *const u8, room)
     };
     let _records = records_read();
-    let read = if into(bytes, &slots) {
-        vec![slots.clone()]
-    } else {
-        let (read, missed): (Vec<_>, Vec<_>) = kernel_pieces(start, step, slots.clone())
-            .into_iter()
-            .partition(|piece| into(bytes, piece));
-        for piece in missed {
-            found.unread += piece.len() as u64;
-            unread.extend(piece.map(|slot| at(slot) / crate::watch::PAGE));
-        }
-        read
-    };
+    let whole = into(bytes, &slots);
     #[cfg(test)]
     if let Some(between) = LOOK_BETWEEN.with(|b| b.borrow_mut().take()) {
         between();
     }
-    found.pages += u64::from(!read.is_empty());
-    let mut changed = Vec::new();
-    for slot in read.into_iter().flatten() {
-        found.slots += 1;
-        let record = &bytes[(slot - slots.start) * step..];
-        let header =
-            std::array::from_fn(|k| u32::from_le_bytes([0, 1, 2, 3].map(|b| record[4 * k + b])));
-        let key = record_key(header);
-        if let Some(note) = watch.noted.get(slot)
-            && note.load(Relaxed) != key
-        {
-            note.store(key, Relaxed);
-            changed.push((slot as u32, key));
+    let mut read = |bytes: &[u8], piece: Range<usize>| {
+        part.found.slots += piece.len() as u64;
+        let offset = (piece.start - slots.start) * step;
+        let len = piece.len() * step;
+        host::changed_records(
+            &watch.noted,
+            &bytes[offset..offset + len],
+            step,
+            piece.start as u32,
+            &mut part.changed,
+        );
+    };
+    if whole {
+        read(bytes, slots.clone());
+        part.found.pages += 1;
+    } else {
+        let mut missed = 0;
+        let mut any = false;
+        for piece in kernel_pieces(start, step, slots.clone()) {
+            if into(bytes, &piece) {
+                read(bytes, piece);
+                any = true;
+            } else {
+                missed += piece.len() as u64;
+                part.unread
+                    .extend(piece.map(|slot| at(slot) / crate::watch::PAGE));
+            }
         }
+        part.found.pages += u64::from(any);
+        part.found.unread += missed;
     }
-    changed
 }
 
 #[cfg(all(test, windows))]
@@ -700,8 +1085,9 @@ thread_local! {
 impl Heap {
     /// [`sync_heaps`]' look at this heap, if it is placed in the title's
     /// memory and has its host heap: the records copied in as bytes since
-    /// the last look mirrored, and what it found added to `found`.
-    fn look_for_copies(&self, found: &mut Copies) {
+    /// the last look mirrored in parallel across the sync worker pool, and
+    /// what it found added to `found`.
+    fn look_for_copies(&self, found: &mut Copies, scan_only: bool) {
         let (Some(watch), Some(Some(host)), Some(step)) =
             (&self.watched, self.host.get(), increment(self.desc.kind))
         else {
@@ -719,8 +1105,10 @@ impl Heap {
         found.unwatched += w.unwatched.len() as u64;
         // Slots past the host heap (a capped one) have no host slot.
         let count = self.desc.count.min(host.count()) as usize;
-        // The first slot not looked at yet: one across two changed pages
-        // is looked at once.
+        // Compute strictly disjoint slot ranges across changed pages before
+        // fanning out: a record straddling two changed pages is checked once,
+        // and no two worker threads ever touch the same slot or note.
+        let mut ranges: Vec<Range<usize>> = Vec::with_capacity(pages.len());
         let mut next = 0;
         for page in pages {
             let slots = page_slots(page, start, step, count);
@@ -729,34 +1117,67 @@ impl Heap {
                 continue;
             }
             next = slots.end;
-            let changed = changed_slots(watch, w, (start, step), slots, found);
-            if changed.is_empty() {
-                continue;
+            ranges.push(slots);
+        }
+        let read_parts: Vec<std::sync::Mutex<SyncPart>> = ranges
+            .chunks(SYNC_PAGES)
+            .map(|_| Default::default())
+            .collect();
+        each_sync(read_parts.len(), &|n| {
+            let mut out = SyncPart::default();
+            let mut bytes = Vec::new();
+            for slots in ranges.chunks(SYNC_PAGES).nth(n).unwrap_or_default() {
+                changed_slots_into(watch, &mut bytes, (start, step), slots.clone(), &mut out);
             }
-            // What their host slots were made from, before the mirror.
-            let indices: Vec<u32> = changed.iter().map(|&(index, _)| index).collect();
-            let made = host.made_keys(&indices);
-            for (&(index, key), made) in changed.iter().zip(made) {
-                let handle = self.start + u64::from(index) * step as u64;
-                let view = host.mirror(index, handle, false);
-                let kind = host.copied_kind(index, view.as_ref());
+            *read_parts[n].lock().unwrap_or_else(|e| e.into_inner()) = out;
+        });
+        let mut changed: Vec<(u32, u64)> = Vec::new();
+        for part in read_parts {
+            let mut part = part.into_inner().unwrap_or_else(|e| e.into_inner());
+            found.add(&part.found);
+            w.unread.extend(part.unread);
+            changed.append(&mut part.changed);
+        }
+        if scan_only {
+            w.pending.extend(changed);
+            return;
+        }
+        if !w.pending.is_empty() {
+            let mut pending = std::mem::take(&mut w.pending);
+            pending.extend(changed);
+            changed = pending.into_iter().collect();
+        }
+        let mirror_parts: Vec<std::sync::Mutex<Copies>> = changed
+            .chunks(SYNC_AT_A_TIME)
+            .map(|_| Default::default())
+            .collect();
+        each_sync(mirror_parts.len(), &|n| {
+            let mut local = Copies::default();
+            for &(index, key) in changed.chunks(SYNC_AT_A_TIME).nth(n).unwrap_or_default() {
+                let made = host.made_key(index);
+                let kind = host
+                    .mirror_copied(index, key, &watch.noted[index as usize])
+                    .unwrap_or(host::CopiedKind::Other);
                 // In the frames listed for capture: each record mirrored,
                 // what its host slot was made from before, and its view.
                 #[cfg(feature = "diagnostics")]
                 if crate::capture::listed(crate::frame::current()) {
                     tracing::debug!(
                         target: "xtp_gpu::heap_sync",
-                        heap = format_args!("{:#x}", self.start),
+                        heap = format_args!("{start:#x}"),
                         slot = index,
                         record = format_args!("{key:#x}"),
                         before = format_args!("{made:#x}"),
                         ?kind,
-                        ?view,
-                        "mirrored a record the title copied in as bytes"
+                        "processed a record the title copied in as bytes"
                     );
                 }
-                found.add_slot(kind, key != 0 && made == key);
+                local.add_slot(kind, key != 0 && made == key);
             }
+            *mirror_parts[n].lock().unwrap_or_else(|e| e.into_inner()) = local;
+        });
+        for part in mirror_parts {
+            found.add(&part.into_inner().unwrap_or_else(|e| e.into_inner()));
         }
     }
 }
@@ -766,10 +1187,12 @@ impl Heap {
 /// that does not look for records copied in as bytes.
 #[cfg(windows)]
 pub(crate) fn take_synced(frames: f64) -> HeapSyncLine {
-    let (copies, micros) = std::mem::take(&mut *SYNCED.lock().unwrap_or_else(|e| e.into_inner()));
+    let (copies, micros, waited_micros) =
+        std::mem::take(&mut *SYNCED.lock().unwrap_or_else(|e| e.into_inner()));
     let mut line = HeapSyncLine {
         copies,
         micros,
+        waited_micros,
         unplaced: 0,
         past: 0,
         frames: frames.max(1.0),
@@ -800,6 +1223,7 @@ pub(crate) fn take_synced(frames: f64) -> HeapSyncLine {
 pub(crate) struct HeapSyncLine {
     copies: Copies,
     micros: u64,
+    waited_micros: u64,
     /// Slots of shader-visible heaps in XTP's memory, whose host heap is
     /// made, and slots of placed heaps past their host heap: not looked at.
     unplaced: u64,
@@ -825,8 +1249,9 @@ impl HeapSyncLine {
              read lately, {:.1} buffer views in heaps whose shaders pick buffers at run time); \
              besides {:.1} textures read through tables, {:.1} buffer views, {:.1} samplers, {:.1} \
              other views, {:.1} no view of ours; {:.1} not what their host slot was made from; \
-             {:.1} slots not mapped (again at the next look); {:.3} ms; {} blocks no write watch \
-             answers for, {} slots of heaps in XTP's memory and {} past host heaps (not looked at)",
+             {:.1} slots not mapped (again at the next look); {:.3} ms ({:.3} ms waited for); \
+             {} blocks no write watch answers for, {} slots of heaps in XTP's memory and {} past \
+             host heaps (not looked at)",
             per(c.pages),
             per(c.slots),
             per(c.copied),
@@ -841,6 +1266,7 @@ impl HeapSyncLine {
             per(c.unmade),
             per(c.unread),
             self.micros as f64 / 1000.0 / self.frames,
+            self.waited_micros as f64 / 1000.0 / self.frames,
             c.unwatched,
             self.unplaced,
             self.past,
@@ -1392,7 +1818,19 @@ struct Views {
     free: Vec<u32>,
 }
 
-static VIEWS: std::sync::Mutex<Views> = std::sync::Mutex::new(Views {
+#[cfg(windows)]
+impl Views {
+    fn live(&self, key: u64) -> Option<&View> {
+        let index = key as u32;
+        let (view, generation) = self.list.get(index as usize)?;
+        (key != 0 && *generation == (key >> 32) as u32 && self.index.get(view) == Some(&index))
+            .then_some(view)
+    }
+}
+
+/// Read far more often than written: every slot a draw reads through a table
+/// or `sync_heaps` checks is looked up here from several threads at once.
+static VIEWS: std::sync::RwLock<Views> = std::sync::RwLock::new(Views {
     list: Vec::new(),
     index: std::collections::BTreeMap::new(),
     by_resource: std::collections::BTreeMap::new(),
@@ -1418,44 +1856,59 @@ fn record(handle: u64, view: View) {
     // Found first: the slot's note is written with its record.
     #[cfg(windows)]
     let slot = shader_slot(handle);
-    let mut views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
-    let i = match views.index.get(&view) {
-        Some(&i) => i,
-        None => {
-            let i = match views.free.pop() {
-                Some(i) => {
-                    views.list[i as usize].0 = view.clone();
-                    i
-                }
-                None => {
-                    views.list.push((view.clone(), 1));
-                    views.list.len() as u32 - 1
-                }
-            };
-            for r in view.resources().into_iter().filter(|&r| r != 0) {
-                views.by_resource.entry(r).or_default().push(i);
-            }
-            views.index.insert(view, i);
-            i
-        }
-    };
-    let generation = views.list[i as usize].1;
-    {
+    // Most views have already been seen; check under the shared read lock
+    // first so concurrent recording and sync threads do not stall.
+    let existing = VIEWS.read().unwrap_or_else(|e| e.into_inner());
+    if let Some(&i) = existing.index.get(&view) {
+        let generation = existing.list[i as usize].1;
         let _records = records_written();
         let header = [VIEW_TAG, i, generation];
         // SAFETY: the handle is a descriptor slot, at least 16 bytes.
         unsafe { (handle as *mut [u32; 3]).write_unaligned(header) };
         #[cfg(windows)]
         note_call(slot, record_key(header));
+        drop(existing);
+    } else {
+        drop(existing);
+        let mut views = VIEWS.write().unwrap_or_else(|e| e.into_inner());
+        let i = match views.index.get(&view) {
+            Some(&i) => i,
+            None => {
+                let i = match views.free.pop() {
+                    Some(i) => {
+                        views.list[i as usize].0 = view.clone();
+                        i
+                    }
+                    None => {
+                        views.list.push((view.clone(), 1));
+                        views.list.len() as u32 - 1
+                    }
+                };
+                for r in view.resources().into_iter().filter(|&r| r != 0) {
+                    views.by_resource.entry(r).or_default().push(i);
+                }
+                views.index.insert(view, i);
+                i
+            }
+        };
+        let generation = views.list[i as usize].1;
+        {
+            let _records = records_written();
+            let header = [VIEW_TAG, i, generation];
+            // SAFETY: the handle is a descriptor slot, at least 16 bytes.
+            unsafe { (handle as *mut [u32; 3]).write_unaligned(header) };
+            #[cfg(windows)]
+            note_call(slot, record_key(header));
+        }
+        drop(views);
     }
-    drop(views);
     #[cfg(windows)]
     mirror(slot, handle);
 }
 
 /// The title released `resource`: the views naming it go stale.
 pub(crate) fn forget(resource: usize) {
-    let mut views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
+    let mut views = VIEWS.write().unwrap_or_else(|e| e.into_inner());
     let Some(entries) = views.by_resource.remove(&resource) else {
         return;
     };
@@ -1477,9 +1930,43 @@ pub(crate) fn forget(resource: usize) {
 /// The view of entry `i` if `generation` is still its own.
 #[cfg(windows)]
 fn view_at(i: u32, generation: u32) -> Option<View> {
-    let views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
+    let views = VIEWS.read().unwrap_or_else(|e| e.into_inner());
     let (view, current) = views.list.get(i as usize)?;
     (*current == generation).then(|| view.clone())
+}
+
+/// The title resources backing a copied view, retained through host
+/// descriptor creation. The final release invalidates VIEWS before freeing
+/// the allocation, so a read of VIEWS can safely try to retain it.
+#[cfg(windows)]
+struct ViewPins([usize; 2]);
+
+#[cfg(windows)]
+impl Drop for ViewPins {
+    fn drop(&mut self) {
+        for resource in self.0.into_iter().filter(|&r| r != 0) {
+            crate::resource::resource_release(resource as This);
+        }
+    }
+}
+
+#[cfg(windows)]
+fn pin_view(key: u64) -> Option<(View, ViewPins)> {
+    let mut pins = ViewPins([0; 2]);
+    let views = VIEWS.read().unwrap_or_else(|e| e.into_inner());
+    let view = views.live(key)?;
+    for (pin, resource) in pins.0.iter_mut().zip(view.resources()) {
+        if resource != 0 {
+            // SAFETY: a live VIEWS entry is invalidated before final release
+            // frees its resource, and the read lock prevents invalidation.
+            if !object::add_ref_alive(resource as This) {
+                // The read lock drops before releasing any successful pins.
+                return None;
+            }
+            *pin = resource;
+        }
+    }
+    Some((view.clone(), pins))
 }
 
 /// The view recorded at `handle`, if one is (and its resource is alive).
@@ -1488,7 +1975,7 @@ pub(crate) fn view(handle: u64) -> Option<View> {
         return None;
     }
     let [tag, i, generation] = header(handle);
-    let views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
+    let views = VIEWS.read().unwrap_or_else(|e| e.into_inner());
     let (view, current) = views.list.get(i as usize)?;
     (tag == VIEW_TAG && *current == generation).then(|| view.clone())
 }
@@ -1736,6 +2223,12 @@ pub(crate) extern "system" fn create_heap(
             Err(hr) => return hr,
         }
     };
+    let Some(end) = start
+        .checked_add(size)
+        .filter(|&end| end <= isize::MAX as u64)
+    else {
+        return E_INVALIDARG;
+    };
     let visible = desc.flags & SHADER_VISIBLE != 0 && matches!(desc.kind, VIEWS_KIND | SAMPLERS);
     let heap = Box::new(Heap {
         object: Object::new(&FUNCTIONS),
@@ -1751,7 +2244,8 @@ pub(crate) extern "system" fn create_heap(
             heap: std::sync::RwLock::new(0),
         }),
         #[cfg(windows)]
-        watched: (placed && visible && heap_sync_used()).then(|| Watch::new(desc.count)),
+        watched: (placed && visible && (cfg!(test) || heap_sync_used()))
+            .then(|| Watch::new(desc.count)),
     });
     // The box does not move: its address is the heap's for its life.
     #[cfg(windows)]
@@ -1760,13 +2254,13 @@ pub(crate) extern "system" fn create_heap(
             std::ptr::from_ref::<Heap>(&heap) as usize;
     }
     #[cfg(windows)]
-    if visible {
+    if visible && !out.is_null() && object::is(iid, &HEAP_IIDS) {
         let at = std::ptr::from_ref::<Heap>(&heap) as usize;
         let mut heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
-        heaps.push((start, start + size, at, heap.hold()));
+        heaps.push((start, end, at, heap.hold()));
     }
     #[cfg(not(windows))]
-    let _ = visible;
+    let _ = (visible, end);
     object::hand_out(DESCRIPTOR_HEAP, heap, iid, &HEAP_IIDS, out)
 }
 
@@ -1945,7 +2439,7 @@ impl PlacedTestHeap {
     /// submission ([`sync_heaps`]): they are mirrored.
     pub(crate) fn look(&self) -> Copies {
         let mut found = Copies::default();
-        heap(self.this).look_for_copies(&mut found);
+        heap(self.this).look_for_copies(&mut found, false);
         found
     }
 }
@@ -2415,7 +2909,7 @@ mod tests {
     #[cfg(windows)]
     fn look(title: &Heap) -> Copies {
         let mut found = Copies::default();
-        title.look_for_copies(&mut found);
+        title.look_for_copies(&mut found, false);
         found
     }
 
@@ -2843,5 +3337,450 @@ mod tests {
         tex[3] = 0;
         (tex[8], tex[9]) = (0, 0);
         assert_eq!(view(handle), Some(View::Placed(false, resource, tex)));
+    }
+
+    /// With `XTP_HEAP_SYNC` unset (the default), `begin_sync_heaps` does
+    /// nothing and spawns no work.
+    #[cfg(windows)]
+    #[test]
+    fn begin_sync_heaps_is_noop_when_unset() {
+        if heap_sync().get() {
+            return;
+        }
+        let synced = begin_sync_heaps(|| panic!("disabled sync must not drain"));
+        assert!(synced.0.is_none());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn sync_pool_caller_runs_jobs_outside_the_state_lock() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        // No helpers, so the submitting thread must take both jobs itself.
+        let pool = SyncPool::empty(2);
+        let visited = AtomicUsize::new(0);
+        pool.each(2, &|job| {
+            assert!(
+                pool.state.try_lock().is_ok(),
+                "job runs under the state lock"
+            );
+            visited.fetch_or(1 << job, Ordering::Relaxed);
+        });
+        assert_eq!(visited.load(Ordering::Relaxed), 0b11);
+    }
+
+    #[test]
+    fn placed_heap_rejects_address_wrap() {
+        let mut h = std::ptr::null();
+        let desc = HeapDesc {
+            kind: VIEWS_KIND,
+            count: 1,
+            flags: SHADER_VISIBLE,
+            nodes: 1,
+        };
+        let placement = Placement {
+            address: u64::MAX - 15,
+            size: 32,
+        };
+        assert_eq!(create(desc, placement, &mut h), E_INVALIDARG);
+        assert!(h.is_null());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn captured_record_does_not_reread_a_page_that_becomes_unreadable() {
+        use windows_sys::Win32::System::Memory::{PAGE_NOACCESS, VirtualProtect};
+        let test =
+            "descriptor::tests::captured_record_does_not_reread_a_page_that_becomes_unreadable";
+        let Some(_gpu) = crate::testgpu::device(test) else {
+            return;
+        };
+        let memory = TitlePages::new(1, 0);
+        let h = placed_views(memory.at as u64, 16);
+        let title = heap(h);
+        let host = title.host().expect("a host heap");
+        let mut record = [0u64; 4];
+        let desc = [0, 0, 0, 0];
+        create_cbv(std::ptr::null(), &desc, record.as_mut_ptr() as u64);
+        store_record(title, &record, 7);
+        let address = memory.at;
+        LOOK_BETWEEN.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                let mut old = 0;
+                // SAFETY: one page of TitlePages owned by this test.
+                let protected =
+                    unsafe { VirtualProtect(address as *const _, 4096, PAGE_NOACCESS, &mut old) };
+                assert_ne!(protected, 0);
+            }));
+        });
+        assert_eq!(look(title).copied, 1);
+        assert_eq!(host.made_key(7), 0, "copied CBV is null until a draw");
+        release_placed(h);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn early_snapshots_wait_for_submission_and_lose_to_newer_api_writes() {
+        use crate::resource::tests_support::{committed, sampled};
+        let test =
+            "descriptor::tests::early_snapshots_wait_for_submission_and_lose_to_newer_api_writes";
+        let Some(_gpu) = crate::testgpu::device(test) else {
+            return;
+        };
+        let memory = TitlePages::new(1, 0);
+        let h = placed_views(memory.at as u64, 16);
+        let title = heap(h);
+        let host = title.host().expect("a host heap");
+        let tex = committed(&sampled(16, 16, 28));
+        let desc = [28, 4, 0x1688, 0, 0, 1, 0, 0, 0, 0];
+        let mut record = [0u64; 4];
+        create_srv(std::ptr::null(), tex, &desc, record.as_mut_ptr() as u64);
+        let key = record_key(header(record.as_ptr() as u64));
+        store_record(title, &record, 3);
+        store_record(title, &record, 4);
+        title.look_for_copies(&mut Copies::default(), true);
+        assert_eq!(host.made_keys(&[3, 4]), [0, 0]);
+        let at = title.start + 4 * 32;
+        let rewrite = [28, 4, 0x1689, 0, 0, 1, 0, 0, 0, 0];
+        create_srv(std::ptr::null(), tex, &rewrite, at);
+        let newer = record_key(header(at));
+        assert_ne!(newer, key);
+        assert_eq!(look(title).copied, 2);
+        assert_eq!(host.made_keys(&[3, 4]), [key, newer]);
+
+        // A prior table read does not let a copied CBV keep the old texture.
+        host.texture_slot_tabled(3);
+        create_cbv(std::ptr::null(), &[0; 4], record.as_mut_ptr() as u64);
+        store_record(title, &record, 3);
+        assert_eq!(look(title).copied, 1);
+        assert_eq!(host.made_key(3), 0);
+
+        // A sampler copied into a view heap must never reach CreateSampler
+        // with a CPU handle from the other heap type.
+        create_sampler(std::ptr::null(), &[0; 13], record.as_mut_ptr() as u64);
+        store_record(title, &record, 4);
+        assert_eq!(look(title).none, 1);
+        assert_eq!(host.made_key(4), 0);
+        release_placed(h);
+        crate::resource::resource_release(tex);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn copied_view_keeps_its_resource_alive_and_rejects_a_vacant_entry() {
+        use crate::resource::tests_support::{committed, sampled};
+        let test =
+            "descriptor::tests::copied_view_keeps_its_resource_alive_and_rejects_a_vacant_entry";
+        let Some(_gpu) = crate::testgpu::device(test) else {
+            return;
+        };
+        let tex = committed(&sampled(16, 16, 28));
+        let mut record = [0u64; 4];
+        create_srv(
+            std::ptr::null(),
+            tex,
+            std::ptr::null(),
+            record.as_mut_ptr() as u64,
+        );
+        let key = record_key(header(record.as_ptr() as u64));
+        let pins = pin_view(key).expect("a retained view");
+        let address = tex as usize;
+        std::thread::scope(|scope| {
+            scope.spawn(move || assert_eq!(crate::resource::resource_release(address as This), 1));
+        });
+        assert!(pin_view(key).is_some());
+        drop(pins);
+        assert!(pin_view(key).is_none());
+        // Another test can reuse the just-freed global entry immediately.
+        // Check a vacant generation against a registry private to this test.
+        let vacant = Views {
+            list: vec![(View::Shader(address, None), 2)],
+            index: Default::default(),
+            by_resource: Default::default(),
+            free: vec![0],
+        };
+        assert!(vacant.live(2 << 32).is_none());
+    }
+
+    /// 8 threads mirror disjoint and overlapping slots while the background
+    /// `xtp-heap-sync` thread scans a multi-page write-watched heap with
+    /// cross-page records (more than `SYNC_PAGES` pages and `SYNC_AT_A_TIME`
+    /// copied slots so `SyncPool` fans out), plus concurrent heap releases
+    /// guarded by `HeapHold`: no missed mirror, no use after free, and the
+    /// lock-free `quick` path hits when records are unchanged.
+    #[cfg(windows)]
+    #[test]
+    fn concurrent_mirror_and_background_sync_with_cross_page_and_release() {
+        use crate::resource::tests_support::{committed, sampled};
+        use crate::watch::PAGE;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::{Arc, Barrier};
+
+        let test =
+            "descriptor::tests::concurrent_mirror_and_background_sync_with_cross_page_and_release";
+        let Some(_gpu) = crate::testgpu::device(test) else {
+            return;
+        };
+        let null = std::ptr::null();
+        // 10 write-watched pages (> SYNC_PAGES = 8) placed 24 bytes into page 0
+        // so slot 2047, 4095, 6143, ... straddle every 64 KiB page boundary.
+        const PAGES: usize = 10;
+        let memory = TitlePages::new(PAGES, 0);
+        let count = ((PAGES * PAGE - 24) / 32) as u32;
+        let desc = HeapDesc {
+            kind: VIEWS_KIND,
+            count,
+            flags: SHADER_VISIBLE,
+            nodes: 1,
+        };
+        let placement = Placement {
+            address: memory.at as u64 + 24,
+            size: u64::from(count) * 32,
+        };
+        // Not added to `LOOKED_AT_BY_TESTS` so `begin_sync_heaps_inner()`
+        // scans this heap on the real `xtp-heap-sync` background thread.
+        let mut h = std::ptr::null();
+        assert_eq!(create(desc, placement, &mut h), S_OK);
+        let title = heap(h);
+        let host = title.host().expect("a host heap");
+        let at = |i: u32| title.start + u64::from(i) * 32;
+
+        // Create two resident texture objects so their slots hit `quick`.
+        let wait_resident = |r: This| {
+            let started = std::time::Instant::now();
+            while crate::resource::host_resource(r).is_none() {
+                assert!(started.elapsed().as_secs() < 5, "never resident");
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+        };
+        let tex_a = committed(&sampled(16, 16, 28));
+        let tex_b = committed(&sampled(16, 16, 28));
+        wait_resident(tex_a);
+        wait_resident(tex_b);
+        let srv_desc = [28, 4, 0x1688, 0, 0, 1, 0, 0, 0, 0];
+        let mut rec_a = [0u64; 4];
+        let mut rec_b = [0u64; 4];
+        create_srv(null, tex_a, &srv_desc, rec_a.as_mut_ptr() as u64);
+        create_srv(null, tex_b, &srv_desc, rec_b.as_mut_ptr() as u64);
+        let key_a = record_key(header(rec_a.as_ptr() as u64));
+        let key_b = record_key(header(rec_b.as_ptr() as u64));
+        assert_ne!(key_a, 0);
+        assert_ne!(key_b, 0);
+        assert_ne!(key_a, key_b);
+
+        // Pre-populate:
+        // - Cross-page boundary slots across all 9 page boundaries (copied as bytes).
+        // - Over 320 copied slots spread across all 10 pages (> SYNC_AT_A_TIME).
+        // - Disjoint ranges for 8 mirroring threads (pre-written via API calls).
+        // - Overlapping slots hammered by all 8 threads simultaneously.
+        let mut copied_expected: Vec<(u32, u64)> = Vec::new();
+        for boundary in 1..PAGES {
+            let boundary_addr = memory.at + boundary * PAGE;
+            let slot = ((boundary_addr - title.start as usize) / 32) as u32;
+            let slot_addr = title.start as usize + slot as usize * 32;
+            assert!(
+                slot_addr < boundary_addr && slot_addr + 32 > boundary_addr,
+                "slot {slot} must straddle page boundary {boundary}"
+            );
+            let (rec, key) = if boundary % 2 == 0 {
+                (&rec_a, key_a)
+            } else {
+                (&rec_b, key_b)
+            };
+            store_record(title, rec, slot);
+            copied_expected.push((slot, key));
+        }
+        for page in 0..PAGES {
+            let base_slot = (page * (PAGE / 32)) as u32 + 100;
+            for offset in 0..36u32 {
+                let slot = base_slot + offset;
+                if slot < count {
+                    let (rec, key) = if (page + offset as usize).is_multiple_of(2) {
+                        (&rec_a, key_a)
+                    } else {
+                        (&rec_b, key_b)
+                    };
+                    store_record(title, rec, slot);
+                    copied_expected.push((slot, key));
+                }
+            }
+        }
+        assert!(copied_expected.len() > SYNC_AT_A_TIME);
+
+        // Disjoint per-thread slots (64 each) + 16 shared overlapping slots.
+        const THREADS: usize = 8;
+        const DISJOINT_BASE: u32 = 10;
+        const DISJOINT_PER_THREAD: u32 = 8;
+        const OVERLAP_BASE: u32 = 80;
+        const OVERLAP_COUNT: u32 = 16;
+        for t in 0..THREADS {
+            for k in 0..DISJOINT_PER_THREAD {
+                let slot = DISJOINT_BASE + (t as u32) * DISJOINT_PER_THREAD + k;
+                create_srv(null, tex_a, &srv_desc, at(slot));
+            }
+        }
+        for k in 0..OVERLAP_COUNT {
+            create_srv(
+                null,
+                if k % 2 == 0 { tex_a } else { tex_b },
+                &srv_desc,
+                at(OVERLAP_BASE + k),
+            );
+        }
+
+        // Make the background mirror and all recording threads contend for
+        // this same slot. It was originally made from tex_a by the API.
+        store_record(title, &rec_b, OVERLAP_BASE);
+        copied_expected.push((OVERLAP_BASE, key_b));
+
+        // Start 8 mirroring threads while the main thread runs background sync
+        // rounds on `xtp-heap-sync`.
+        let barrier = Arc::new(Barrier::new(THREADS + 1));
+        let stop = Arc::new(AtomicBool::new(false));
+        let hold = title.hold();
+        let quick_before = host.quick_hits();
+        let mut workers = Vec::with_capacity(THREADS);
+        for t in 0..THREADS {
+            let barrier = barrier.clone();
+            let stop = stop.clone();
+            let hold = hold.clone();
+            workers.push(std::thread::spawn(move || {
+                barrier.wait();
+                let my_base = DISJOINT_BASE + (t as u32) * DISJOINT_PER_THREAD;
+                let mut rounds = 0u32;
+                while !stop.load(Ordering::Acquire) || rounds < 20 {
+                    rounds += 1;
+                    hold.with(|heap| {
+                        let Some(Some(host)) = heap.host.get() else {
+                            return;
+                        };
+                        for k in 0..DISJOINT_PER_THREAD {
+                            let slot = my_base + k;
+                            let handle = heap.start + u64::from(slot) * 32;
+                            assert!(host.mirror(slot, handle, true).is_some());
+                        }
+                        for k in 0..OVERLAP_COUNT {
+                            let slot = OVERLAP_BASE + k;
+                            let handle = heap.start + u64::from(slot) * 32;
+                            assert!(host.mirror(slot, handle, true).is_some());
+                        }
+                    });
+                }
+            }));
+        }
+
+        barrier.wait();
+        for round in 0..8 {
+            let synced = begin_sync_heaps_inner();
+            // Copy one more batch of records mid-flight on odd rounds.
+            if round % 2 == 1 {
+                let slot = 1500 + round as u32;
+                store_record(title, &rec_b, slot);
+                copied_expected.push((slot, key_b));
+            }
+            if round == 0 {
+                // Two requests can be outstanding. The later ticket cannot
+                // finish until both rounds have completed.
+                begin_sync_heaps_inner().finish();
+            }
+            synced.finish();
+        }
+        stop.store(true, Ordering::Release);
+        for w in workers {
+            w.join().expect("mirror worker finished cleanly");
+        }
+        // One final background sync round ensures late byte copies are mirrored.
+        begin_sync_heaps_inner().finish();
+
+        let quick_delta = host.quick_hits() - quick_before;
+        assert!(
+            quick_delta > 0,
+            "unchanged mirrors under 8 threads must hit the lock-free quick path"
+        );
+        for (slot, expected_key) in &copied_expected {
+            assert_eq!(
+                host.made_key(*slot),
+                *expected_key,
+                "copied slot {slot} was missed by background sync"
+            );
+        }
+        for t in 0..THREADS {
+            for k in 0..DISJOINT_PER_THREAD {
+                let slot = DISJOINT_BASE + (t as u32) * DISJOINT_PER_THREAD + k;
+                assert_eq!(host.made_key(slot), key_a);
+            }
+        }
+        for k in 0..OVERLAP_COUNT {
+            let slot = OVERLAP_BASE + k;
+            let expected = if k != 0 && k % 2 == 0 { key_a } else { key_b };
+            assert_eq!(host.made_key(slot), expected);
+        }
+
+        // Concurrent heap release while background sync is running: `HeapHold`
+        // prevents any use after free and release completes cleanly.
+        for _ in 0..6 {
+            let pages = TitlePages::new(2, 0);
+            let c2 = ((2 * PAGE - 16) / 32) as u32;
+            let d2 = HeapDesc {
+                kind: VIEWS_KIND,
+                count: c2,
+                flags: SHADER_VISIBLE,
+                nodes: 1,
+            };
+            let p2 = Placement {
+                address: pages.at as u64 + 16,
+                size: u64::from(c2) * 32,
+            };
+            let mut h2 = std::ptr::null();
+            assert_eq!(create(d2, p2, &mut h2), S_OK);
+            let t2 = heap(h2);
+            t2.host().expect("a host heap");
+            let hold2 = t2.hold();
+            for s in (0..64u32).chain([2047]) {
+                store_record(t2, &rec_a, s);
+            }
+            let raw_h2 = h2 as usize;
+            let (held, scanning) = std::sync::mpsc::channel();
+            let (resume, paused) = std::sync::mpsc::channel();
+            *BEFORE_LOOK.lock().unwrap() = Some(BeforeLook {
+                heap: raw_h2,
+                pause: Box::new(move || {
+                    held.send(()).expect("test waiting for the hold");
+                    paused.recv().expect("test resumes the scan");
+                }),
+            });
+            std::thread::scope(|scope| {
+                let sync = scope.spawn(|| begin_sync_heaps_inner().finish());
+                if scanning
+                    .recv_timeout(std::time::Duration::from_secs(10))
+                    .is_err()
+                {
+                    drop(resume);
+                    panic!("background scan did not acquire the heap");
+                }
+                let (started, releasing) = std::sync::mpsc::channel();
+                let (done, released) = std::sync::mpsc::channel();
+                let releaser = scope.spawn(move || {
+                    started.send(()).unwrap();
+                    release(raw_h2 as This);
+                    done.send(()).unwrap();
+                });
+                releasing.recv().unwrap();
+                let blocked = released
+                    .recv_timeout(std::time::Duration::from_millis(20))
+                    .is_err();
+                resume.send(()).unwrap();
+                releaser.join().expect("heap release did not panic");
+                sync.join().expect("scan completed");
+                assert!(blocked, "release waits for the live scan");
+            });
+            assert!(hold2.with(|_| ()).is_none(), "released heap is gone");
+            drop(pages);
+        }
+
+        release(h);
+        type Release = extern "system" fn(This) -> u32;
+        slot::<Release>(tex_a, 0x10)(tex_a);
+        slot::<Release>(tex_b, 0x10)(tex_b);
+        drop(memory);
     }
 }
