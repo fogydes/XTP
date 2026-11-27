@@ -61,7 +61,7 @@
 
 mod buffer;
 #[cfg(test)]
-pub(crate) use buffer::{INTEGER_LOAD_PROGRAM_TEST, code_fingerprint};
+pub(crate) use buffer::{INTEGER_LOAD_PROGRAM_TEST, NORM_QUOTIENTS, code_fingerprint};
 mod compare;
 mod descriptor;
 mod export;
