@@ -233,7 +233,7 @@ fn trace(mut t: Tracer<'_>) -> Result<Resources, ShaderError> {
             let mut first_lane = Vec::new();
             let mut offset = Vec::new();
             let mut descriptor = |op: &Operand, role| -> Result<(), ShaderError> {
-                let source = t.descriptor(inst, op, b).map_err(fail)?;
+                let source = t.descriptor(inst, op, site).map_err(fail)?;
                 first_lane.extend(t.first_lane_words(inst, op).unwrap_or_default());
                 if let Source::Loaded { load, .. } = source
                     && let Some((_, a)) = out.scalar.iter().find(|s| s.0 == load)
@@ -272,7 +272,7 @@ fn trace(mut t: Tracer<'_>) -> Result<Resources, ShaderError> {
                     ..
                 } if inst.name().starts_with("global_") => {
                     let address = t
-                        .flat_address(inst, addr.as_ref(), saddr.as_ref(), *offset)
+                        .flat_address(site, addr.as_ref(), saddr.as_ref(), *offset)
                         .map_err(fail)?;
                     out.scalar.push((site, address));
                 }
@@ -901,7 +901,7 @@ impl<'a> Tracer<'a> {
     /// pair.
     fn flat_address(
         &self,
-        inst: &Inst,
+        site: Site,
         addr: Option<&Operand>,
         saddr: Option<&Operand>,
         offset: i16,
@@ -909,6 +909,7 @@ impl<'a> Tracer<'a> {
         let Some(&Operand::Vector { reg, .. }) = addr else {
             return Err("a global address not in VGPRs");
         };
+        let inst = self.inst(site);
         let off = offset as i32 as u32;
         match saddr {
             Some(&Operand::Scalar { code, .. }) if code != NULL => {
@@ -922,6 +923,8 @@ impl<'a> Tracer<'a> {
                     return Err("an offset from a root parameter");
                 }
                 extra.offset = extra.offset.wrapping_add(off);
+                let mut known = self.site_known(site);
+                let hi = self.high_on_edge(hi, &mut known);
                 self.address(lo, hi, extra)
             }
             _ => {
@@ -1069,6 +1072,44 @@ impl<'a> Tracer<'a> {
         }
     }
 
+    /// Active-lane conditions for an access at `at`: block reachability plus
+    /// the instruction's EXEC guard when present (`None` for scalar accesses).
+    fn site_known(&self, at: Site) -> Known {
+        let mut known = Vec::new();
+        if let Some(l) = self.lanes {
+            known.push((l.reach[at.0], true));
+            if let Some(guard) = l
+                .guards
+                .get(at.0)
+                .and_then(|g| g.get(at.1))
+                .copied()
+                .flatten()
+            {
+                known.push((guard, true));
+            }
+        }
+        known
+    }
+
+    /// Unwraps SGPR high-word phis whose wave path is forced to a single
+    /// incoming edge under `known` (up to [`MAX_JOINS`] nested joins).
+    fn high_on_edge(&self, mut hi: Term, known: &mut Known) -> Term {
+        let n = known.len();
+        for _ in 0..MAX_JOINS {
+            let Term::Value(v) = hi else { break };
+            let Some((block, index)) = self.phis[v.0 as usize] else {
+                break;
+            };
+            let Some((edge, conditions)) = self.only_edge(block, known) else {
+                break;
+            };
+            known.extend(conditions);
+            hi = self.origin(self.p.blocks[block].phis[index].args[edge]);
+        }
+        known.truncate(n);
+        hi
+    }
+
     fn smem_address(
         &self,
         site: Site,
@@ -1093,19 +1134,15 @@ impl<'a> Tracer<'a> {
         }
         extra.offset = extra.offset.wrapping_add(offset as u32);
         // An arm may set the upper SGPR only for waves that reach this load.
-        // Validate the word written on that edge against the base as usual.
-        let high_on_edge = || {
-            let Term::Value(v) = hi else { return None };
-            let (block, index) = self.phis[v.0 as usize]?;
-            let mut known = vec![(self.lanes?.reach[site.0], true)];
-            let (edge, _) = self.only_edge(block, &mut known)?;
-            Some(self.origin(self.p.blocks[block].phis[index].args[edge]))
-        };
-        self.address(lo, high_on_edge().unwrap_or(hi), extra)
+        // SMEM instructions are not EXEC-masked (`guards` is `None`), so
+        // `site_known` uses block reachability alone.
+        let mut known = self.site_known(site);
+        let hi = self.high_on_edge(hi, &mut known);
+        self.address(lo, hi, extra)
     }
 
-    /// The source of the descriptor operand `op` of `inst`, in block `at`.
-    fn descriptor(&self, inst: &Inst, op: &Operand, at: usize) -> Result<Source, &'static str> {
+    /// The source of the descriptor operand `op` of `inst`, at `at`.
+    fn descriptor(&self, inst: &Inst, op: &Operand, at: Site) -> Result<Source, &'static str> {
         let Operand::Scalar { code, dwords } = *op else {
             return Err("a descriptor not in SGPRs");
         };
@@ -1113,8 +1150,8 @@ impl<'a> Tracer<'a> {
             .map(|k| inst.read(Reg::S(code + k)).map(|v| self.origin(v)))
             .collect::<Option<Vec<_>>>()
             .ok_or("a descriptor not in SGPRs")?;
-        // Only the lanes that reach the access read the descriptor.
-        let mut known = Vec::from_iter(self.lanes.map(|l| (l.reach[at], true)));
+        // Only the lanes that reach and run the access read the descriptor.
+        let mut known = self.site_known(at);
         self.classify(&words, &mut Vec::new(), &mut known)
     }
 
@@ -1168,6 +1205,7 @@ impl<'a> Tracer<'a> {
             {
                 (hi, bits) = (x, bits | more);
             }
+            let hi = self.high_on_edge(hi, known);
             let address = self.address(
                 lo,
                 hi,
@@ -2202,7 +2240,7 @@ impl<'a> Tracer<'a> {
             else {
                 return Err("a global load");
             };
-            self.flat_address(inst, addr.as_ref(), saddr.as_ref(), *offset)
+            self.flat_address(site, addr.as_ref(), saddr.as_ref(), *offset)
         };
         let (load, first) = sites[0];
         let a0 = address(load)?;
@@ -5094,5 +5132,320 @@ pub(crate) mod tests {
         assert_eq!(table_offset(&r, other), 0x20);
         assert_eq!(r.waterfall.compares.len(), 2);
         assert_eq!(r.waterfall.reads.len(), 4);
+    }
+
+    #[test]
+    fn a_guarded_access_excludes_dead_lane_edges_at_a_join() {
+        // Lanes failing `v_cmp_gt_u32` clear EXEC and take `s_cbranch_execz`
+        // directly to the join block without initializing the immediate
+        // sampler `s[8:11]`. The join's `image_sample_lz` is guarded by EXEC,
+        // so only the arm where `s[8:11]` was built can execute it.
+        let code: Vec<u8> = [
+            0xBE84_0300u32, // s_mov_b32 s4, s0
+            0xBE85_0380,    // s_mov_b32 s5, 0
+            0xF40C_0302,
+            0xFA00_0000, // s_load_dwordx8 s[12:19], s[4:5], 0x0
+            0x7E04_0D00, // v_cvt_f32_u32 v2, v0
+            0x7E06_0302, // v_mov_b32 v3, v2
+            0x7D88_0090, // v_cmp_gt_u32 vcc_lo, 16, v0
+            0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+            0x877E_6A7E, // s_and_b32 exec_lo, exec_lo, vcc_lo
+            0xBF88_0004, // s_cbranch_execz -> join (skips 4 dwords)
+            0xBE88_0380, // s_mov_b32 s8, 0
+            0xBE89_0380, // s_mov_b32 s9, 0
+            0xBE8A_0380, // s_mov_b32 s10, 0
+            0xBE8B_0380, // s_mov_b32 s11, 0
+            0xF09C_0F08,
+            0x0043_0C02, // image_sample_lz v[12:15], v[2:3], s[12:19], s[8:11]
+            S_ENDPGM,
+        ]
+        .iter()
+        .flat_map(|w| w.to_le_bytes())
+        .collect();
+        let p = crate::ir::build(&code, false, 256).unwrap();
+        let structured = lanes(&p).expect("structured form");
+        assert!(
+            structured.guards[2][0].is_some(),
+            "join access must carry an EXEC guard"
+        );
+        let r = track(&p, &[param(Table, 0, 1)], HwStage::Cs, Some(&structured)).unwrap();
+        assert!(
+            r.descriptors
+                .iter()
+                .any(|d| d.role == Role::Sampler && d.source == Source::Constant(vec![0; 4])),
+            "guarded join should resolve the immediate sampler from the live arm: {:?}",
+            r.descriptors
+        );
+    }
+
+    #[test]
+    fn a_guarded_access_still_refuses_a_descriptor_rewritten_by_other_lanes() {
+        // Removing the second `s_cbranch_execz` puts the odd lanes'
+        // `image_sample_lz` directly in the join block under an EXEC guard.
+        // Even lanes still rewrite `s8` in the first arm, so a mixed wave
+        // samples with the rewritten descriptor: must remain refused.
+        let mut words = rewritten_in_an_arm();
+        let second_skip = word_at(&words, 0xBF88_0005);
+        words[second_skip] = 0xBF80_0000; // s_nop 0
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let p = crate::ir::build(&code, false, 256).unwrap();
+        let st = lanes(&p).expect("structured form");
+        let join = block_at(&words, 0x50);
+        let sample = p.blocks[join]
+            .insts
+            .iter()
+            .position(|inst| inst.name() == "image_sample_lz")
+            .unwrap();
+        assert!(
+            st.guards[join][sample].is_some(),
+            "join access must carry an EXEC guard"
+        );
+        assert_eq!(refusal(&words, false), "a descriptor changed after loading");
+    }
+
+    #[test]
+    fn a_guarded_access_excludes_dead_lane_edges_after_a_long_reach_chain() {
+        // 17 compound early-out clauses make `reach` at the guarded join carry
+        // 3^17 > MAX_MEET satisfying assignments. `only_edge` must still prove
+        // that the join's EXEC guard contradicts the dead skip edge.
+        let mut words = vec![
+            0xBE84_0300u32, // s_mov_b32 s4, s0
+            0xBE85_0380,    // s_mov_b32 s5, 0
+            0xF40C_0302,
+            0xFA00_0000, // s_load_dwordx8 s[12:19], s[4:5], 0x0
+            0x7E04_0D00, // v_cvt_f32_u32 v2, v0
+            0x7E06_0302, // v_mov_b32 v3, v2
+        ];
+        const CLAUSES: usize = 17;
+        const TAIL_WORDS: usize = 11; // compare + waitcnt + and + branch + 4 movs + sample(2) + endpgm
+        for k in 0..CLAUSES {
+            let remaining = (CLAUSES - 1 - k) * 6 + TAIL_WORDS - 1;
+            words.extend([
+                0x7D84_0080 + k as u32,         // v_cmp_eq_u32 vcc_lo, k, v0
+                0xBE94_036A,                    // s_mov_b32 s20, vcc_lo
+                0x7D84_0280 + k as u32,         // v_cmp_eq_u32 vcc_lo, k, v1
+                0x8714_6A14,                    // s_and_b32 s20, s20, vcc_lo
+                0x8A7E_147E,                    // s_andn2_b32 exec_lo, exec_lo, s20
+                0xBF88_0000 | remaining as u32, // s_cbranch_execz -> s_endpgm
+            ]);
+        }
+        words.extend([
+            0x7D88_0090, // v_cmp_gt_u32 vcc_lo, 16, v0
+            0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+            0x877E_6A7E, // s_and_b32 exec_lo, exec_lo, vcc_lo
+            0xBF88_0004, // s_cbranch_execz -> join (skips 4 dwords)
+            0xBE88_0380, // s_mov_b32 s8, 0
+            0xBE89_0380, // s_mov_b32 s9, 0
+            0xBE8A_0380, // s_mov_b32 s10, 0
+            0xBE8B_0380, // s_mov_b32 s11, 0
+            0xF09C_0F08,
+            0x0043_0C02, // image_sample_lz v[12:15], v[2:3], s[12:19], s[8:11]
+            S_ENDPGM,
+        ]);
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let p = crate::ir::build(&code, false, 256).unwrap();
+        let structured = lanes(&p).expect("structured form");
+        let join = p
+            .blocks
+            .iter()
+            .position(|b| b.insts.iter().any(|i| i.name() == "image_sample_lz"))
+            .unwrap();
+        assert!(
+            structured.guards[join][0].is_some(),
+            "join access must carry an EXEC guard"
+        );
+        assert!(
+            structured.bools.support(structured.reach[join]).len() >= CLAUSES * 2,
+            "reach at the join must retain all {CLAUSES} compound clauses"
+        );
+        let r = track(&p, &[param(Table, 0, 1)], HwStage::Cs, Some(&structured)).unwrap();
+        assert!(
+            r.descriptors
+                .iter()
+                .any(|d| d.role == Role::Sampler && d.source == Source::Constant(vec![0; 4])),
+            "guarded join after a long reach chain must resolve the live arm: {:?}",
+            r.descriptors
+        );
+    }
+
+    #[test]
+    fn a_guarded_wave64_access_excludes_dead_lane_edges_at_a_join() {
+        let words = [
+            0xBE84_0300u32, // s_mov_b32 s4, s0
+            0xBE85_0380,    // s_mov_b32 s5, 0
+            0xF40C_0302,
+            0xFA00_0000, // s_load_dwordx8 s[12:19], s[4:5], 0x0
+            0x7E04_0D00, // v_cvt_f32_u32 v2, v0
+            0x7E06_0302, // v_mov_b32 v3, v2
+            0x7D88_0090, // v_cmp_gt_u32 vcc, 16, v0
+            0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+            0x87FE_6A7E, // s_and_b64 exec, exec, vcc
+            0xBF88_0004, // s_cbranch_execz -> join
+            0xBE88_0380, // s_mov_b32 s8, 0
+            0xBE89_0380, // s_mov_b32 s9, 0
+            0xBE8A_0380, // s_mov_b32 s10, 0
+            0xBE8B_0380, // s_mov_b32 s11, 0
+            0xF09C_0F08,
+            0x0043_0C02, // image_sample_lz v[12:15], v[2:3], s[12:19], s[8:11]
+            S_ENDPGM,
+        ];
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let p = crate::ir::build(&code, true, 256).unwrap();
+        let structured = lanes(&p).expect("structured form");
+        assert!(structured.guards[2][0].is_some());
+        let r = track(&p, &[param(Table, 0, 1)], HwStage::Cs, Some(&structured)).unwrap();
+        assert!(
+            r.descriptors
+                .iter()
+                .any(|d| d.role == Role::Sampler && d.source == Source::Constant(vec![0; 4])),
+            "{:?}",
+            r.descriptors
+        );
+    }
+
+    #[test]
+    fn a_scalar_buffer_load_at_a_guarded_join_still_refuses_dead_edge() {
+        // `s_buffer_load_dword` is an SMEM instruction and ignores EXEC, so a
+        // wave taking `s_cbranch_execz` still executes it with uninitialized
+        // descriptor SGPRs `s[8:11]`. Must remain refused.
+        let code: Vec<u8> = [
+            0xBE84_0300u32, // s_mov_b32 s4, s0
+            0xBE85_0380,    // s_mov_b32 s5, 0
+            0x7D88_0090,    // v_cmp_gt_u32 vcc_lo, 16, v0
+            0x877E_6A7E,    // s_and_b32 exec_lo, exec_lo, vcc_lo
+            0xBF88_0002,    // s_cbranch_execz -> join (skips 2 dwords)
+            0xF408_0202,
+            0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], null
+            0xF420_0504,
+            0xFA00_0000, // join: s_buffer_load_dword s20, s[8:11], null
+            S_ENDPGM,
+        ]
+        .iter()
+        .flat_map(|w| w.to_le_bytes())
+        .collect();
+        let p = crate::ir::build(&code, false, 256).unwrap();
+        let structured = lanes(&p).expect("structured form");
+        assert_eq!(structured.guards[2][0], None);
+        let err = track(&p, &[param(Table, 0, 1)], HwStage::Cs, Some(&structured)).unwrap_err();
+        assert!(matches!(
+            err,
+            ShaderError::Unsupported {
+                what: "a descriptor neither loaded nor built",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn a_guarded_access_with_zero_exec_still_refuses_uninitialized_join() {
+        // Setting EXEC to 0 before the join access yields `guard == Bool::FALSE`;
+        // `only_edge` must see zero live edges and refuse cleanly without panicking.
+        let code: Vec<u8> = [
+            0xBE84_0300u32, // s_mov_b32 s4, s0
+            0xBE85_0380,    // s_mov_b32 s5, 0
+            0xF40C_0302,
+            0xFA00_0000, // s_load_dwordx8 s[12:19], s[4:5], 0x0
+            0x7E04_0D00, // v_cvt_f32_u32 v2, v0
+            0x7E06_0302, // v_mov_b32 v3, v2
+            0x7D88_0090, // v_cmp_gt_u32 vcc_lo, 16, v0
+            0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+            0x877E_6A7E, // s_and_b32 exec_lo, exec_lo, vcc_lo
+            0xBF88_0004, // s_cbranch_execz -> join
+            0xBE88_0380, // s_mov_b32 s8, 0
+            0xBE89_0380, // s_mov_b32 s9, 0
+            0xBE8A_0380, // s_mov_b32 s10, 0
+            0xBE8B_0380, // s_mov_b32 s11, 0
+            0xBEFE_0380, // join: s_mov_b32 exec_lo, 0
+            0xF09C_0F08,
+            0x0043_0C02, // image_sample_lz v[12:15], v[2:3], s[12:19], s[8:11]
+            S_ENDPGM,
+        ]
+        .iter()
+        .flat_map(|w| w.to_le_bytes())
+        .collect();
+        let p = crate::ir::build(&code, false, 256).unwrap();
+        let structured = lanes(&p).expect("structured form");
+        assert_eq!(structured.guards[2][1], Some(Bool::FALSE));
+        let err = track(&p, &[param(Table, 0, 1)], HwStage::Cs, Some(&structured)).unwrap_err();
+        assert!(matches!(
+            err,
+            ShaderError::Unsupported {
+                what: "a descriptor neither loaded nor built",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn a_guarded_global_load_resolves_saddr_high_word_from_live_arm() {
+        // `global_load_dwordx4` is EXEC-masked and takes an SGPR base `s[4:5]`.
+        // Clearing `s5 = 0` only in the `s_cbranch_execz` arm resolves cleanly
+        // when the join's load is guarded by EXEC, and still fails when `s5 = 1`.
+        let make = |high: u32| {
+            let code: Vec<u8> = [
+                0xBE84_0300u32,     // s_mov_b32 s4, s0
+                0x7D88_0090,        // v_cmp_gt_u32 vcc_lo, 16, v0
+                0x877E_6A7E,        // s_and_b32 exec_lo, exec_lo, vcc_lo
+                0xBF88_0001,        // s_cbranch_execz -> join (skips 1 dword)
+                0xBE85_0300 | high, // s_mov_b32 s5, high
+                0xDC38_8000,
+                0x0404_0001, // join: global_load_dwordx4 v[4:7], v1, s[4:5]
+                S_ENDPGM,
+            ]
+            .iter()
+            .flat_map(|w| w.to_le_bytes())
+            .collect();
+            let p = crate::ir::build(&code, false, 256).unwrap();
+            let st = lanes(&p).expect("structured form");
+            assert!(st.guards[2][0].is_some());
+            track(&p, &[param(Table, 0, 1)], HwStage::Cs, Some(&st))
+        };
+        let r = make(128).unwrap(); // inline 0
+        assert_eq!(r.scalar.len(), 1);
+        assert_eq!(r.scalar[0].1.param, 0);
+        assert!(matches!(
+            make(129), // inline 1
+            Err(ShaderError::Unsupported {
+                what: "an address with an untracked high half",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn a_guarded_built_descriptor_resolves_high_word_through_set_bits() {
+        // The high half of a root buffer descriptor is copied into `s5` only in
+        // the live arm, and `s_or_b32` sets descriptor bits in the join block
+        // before a guarded `buffer_store_dword`.
+        let code: Vec<u8> = [
+            0xBE84_0300u32, // s_mov_b32 s4, s0
+            0xBE86_03C1,    // s_mov_b32 s6, -1
+            0xBE87_03FF,
+            0x1101_4FAC, // s_mov_b32 s7, 0x11014fac
+            0x7D88_0090, // v_cmp_gt_u32 vcc_lo, 16, v0
+            0x877E_6A7E, // s_and_b32 exec_lo, exec_lo, vcc_lo
+            0xBF88_0001, // s_cbranch_execz -> join (skips 1 dword)
+            0xBE85_0301, // s_mov_b32 s5, s1
+            0x8805_FF05,
+            0x0010_0000, // join: s_or_b32 s5, s5, 0x100000
+            0xE070_1000,
+            0x8001_0102, // buffer_store_dword v1, v2, s[4:7], 0 offen
+            S_ENDPGM,
+        ]
+        .iter()
+        .flat_map(|w| w.to_le_bytes())
+        .collect();
+        let p = crate::ir::build(&code, false, 256).unwrap();
+        let st = lanes(&p).expect("structured form");
+        assert!(st.guards[2][1].is_some());
+        let r = track(&p, &[param(Descriptor, 0, 2)], HwStage::Cs, Some(&st)).unwrap();
+        assert_eq!(
+            r.descriptors[0].source,
+            Source::Built {
+                address: at(0, 0),
+                bits: 0x10_0000,
+                words: [u32::MAX, 0x1101_4FAC],
+            }
+        );
     }
 }

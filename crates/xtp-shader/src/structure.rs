@@ -234,31 +234,66 @@ impl Bools {
     /// too large to finish.
     pub fn meet(&self, all: &[(Bool, bool)]) -> bool {
         let mut budget = MAX_MEET;
-        self.meet_in(all.to_vec(), &mut budget)
+        let mut failed: HashSet<Vec<u32>, BuildHasherDefault<Fx>> = HashSet::default();
+        let codes: Vec<u32> = all
+            .iter()
+            .map(|&(b, holds)| {
+                debug_assert!(b.0 < (1 << 31));
+                (b.0 << 1) | u32::from(holds)
+            })
+            .collect();
+        self.meet_in(codes, &mut budget, &mut failed)
     }
 
-    fn meet_in(&self, mut all: Vec<(Bool, bool)>, budget: &mut usize) -> bool {
-        let fails = |&(b, holds): &(Bool, bool)| b == if holds { Bool::FALSE } else { Bool::TRUE };
-        if all.iter().any(fails) {
-            return false;
+    fn meet_in(
+        &self,
+        mut all: Vec<u32>,
+        budget: &mut usize,
+        failed: &mut HashSet<Vec<u32>, BuildHasherDefault<Fx>>,
+    ) -> bool {
+        let mut kept = 0;
+        for i in 0..all.len() {
+            let code = all[i];
+            let (b, holds) = (code >> 1, code & 1 != 0);
+            if b <= Bool::TRUE.0 {
+                if (b == Bool::TRUE.0) != holds {
+                    return false;
+                }
+            } else {
+                all[kept] = code;
+                kept += 1;
+            }
         }
-        all.retain(|&(b, _)| b != Bool::FALSE && b != Bool::TRUE);
+        all.truncate(kept);
         if all.is_empty() || *budget == 0 {
             return true;
         }
+        all.sort_unstable();
+        all.dedup();
+        if all.windows(2).any(|w| (w[0] ^ w[1]) == 1) {
+            return false;
+        }
+        if failed.contains(&all) {
+            return false;
+        }
         *budget -= 1;
-        let top = |b: Bool| self.nodes[b.0 as usize].0;
-        let v = all.iter().map(|&(b, _)| top(b)).min().expect("not empty");
-        [false, true].into_iter().any(|value| {
+        let top = |code: u32| self.nodes[(code >> 1) as usize].0;
+        let v = all.iter().map(|&c| top(c)).min().expect("not empty");
+        let found = [false, true].into_iter().any(|value| {
             let next = all
                 .iter()
-                .map(|&(b, holds)| {
-                    let (lo, hi) = self.split(b, v);
-                    (if value { hi } else { lo }, holds)
+                .map(|&code| {
+                    let (lo, hi) = self.split(Bool(code >> 1), v);
+                    let next = if value { hi } else { lo };
+                    (next.0 << 1) | (code & 1)
                 })
                 .collect();
-            self.meet_in(next, budget)
-        })
+            self.meet_in(next, budget, failed)
+        });
+        if !found {
+            failed.insert(all);
+        }
+        found
     }
 
     fn implies(&mut self, a: Bool, b: Bool) -> bool {
@@ -1934,5 +1969,27 @@ mod tests {
             assert!(res.masks.contains_key(&phi_s2));
             assert!(res.sccs.contains_key(&scc));
         }
+    }
+
+    #[test]
+    fn meet_memoizes_unsat_cofactors_behind_a_long_reach_chain() {
+        // 17 independent (!a_k | !b_k) clauses have 3^17 > MAX_MEET satisfying
+        // assignments on only 34 BDD nodes. An unmemoized search exhausts
+        // MAX_MEET before proving the trailing guard contradicts its branch.
+        let mut b = Bools::new();
+        let mut reach = Bool::TRUE;
+        for k in 0..17u32 {
+            let ak = b.atom(Atom::Lane(Value(2 * k)), 0);
+            let bk = b.atom(Atom::Lane(Value(2 * k + 1)), 0);
+            let nak = b.not(ak);
+            let nbk = b.not(bk);
+            let clause = b.or(nak, nbk);
+            reach = b.and(reach, clause);
+        }
+        let guard = b.atom(Atom::Lane(Value(100)), 0);
+        let skip = b.not(guard);
+        assert!(!b.meet(&[(reach, true), (guard, true), (skip, true)]));
+        assert!(!b.meet(&[(reach, true), (guard, true), (guard, false)]));
+        assert!(b.meet(&[(reach, true), (guard, true)]));
     }
 }
