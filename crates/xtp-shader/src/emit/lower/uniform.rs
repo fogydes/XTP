@@ -779,7 +779,10 @@ impl<'a> Run<'a> {
                 .entry(w)
                 .and_modify(|x| *x = (*x).max(l))
                 .or_insert(l);
-            let waterfall = self.x.res.waterfall.reads.contains(&w);
+            let waterfall = self.x.res.waterfall.reads.contains(&w)
+                || (self.x.native.wave64
+                    && !self.x.target.runs(64)
+                    && self.x.res.waterfall.indices.contains(&w));
             let out = if waterfall || l <= Level::Wave {
                 l
             } else {

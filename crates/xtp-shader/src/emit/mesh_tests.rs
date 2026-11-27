@@ -329,6 +329,19 @@ fn lds_order_within_a_console_wave() {
     }
 }
 
+/// The console lane in v3 and thread in v0 for the strip draws.
+const STRIP_THREAD: &[u32] = &[
+    0xD765_0000,
+    0x0001_00C1, // v_mbcnt_lo_u32_b32 v0, -1, 0
+    0xD766_0000,
+    0x0002_00C1, // v_mbcnt_hi_u32_b32 v0, -1, v0
+    0x7E06_0300, // v_mov_b32 v3, v0 (the lane)
+    0x9382_FF03,
+    0x0004_0018, // s_bfe_u32 s2, s3, lit(0x00040018) (the wave)
+    0xD746_0000,
+    0x0401_0C02, // v_lshl_add_u32 v0, s2, 6, v0 (the thread)
+];
+
 /// The program [`wave64_mesh_reads_draw_the_console_waves_values`] draws.
 /// Thread t of the group (console wave w = t / 64, lane l = t % 64)
 /// exports vertex t at x = t / 2 of 63 columns, at the top when t is even
@@ -350,15 +363,6 @@ fn lds_order_within_a_console_wave() {
 ///   value).
 fn drawn_mesh() -> NativeProgram {
     let words = [
-        0xD765_0000,
-        0x0001_00C1, // v_mbcnt_lo_u32_b32 v0, -1, 0
-        0xD766_0000,
-        0x0002_00C1, // v_mbcnt_hi_u32_b32 v0, -1, v0
-        0x7E06_0300, // v_mov_b32 v3, v0 (the lane)
-        0x9382_FF03,
-        0x0004_0018, // s_bfe_u32 s2, s3, lit(0x00040018) (the wave)
-        0xD746_0000,
-        0x0401_0C02, // v_lshl_add_u32 v0, s2, 6, v0 (the thread)
         0xBE84_0387, // s_mov_b32 s4, 7
         0x7E02_0204, // v_mov_b32 v1, s4
         0x7E0A_0501, // v_readfirstlane_b32 s5, v1
@@ -384,6 +388,14 @@ fn drawn_mesh() -> NativeProgram {
         0x7E16_0C07, // v_cvt_f32_u32 v11, s7
         0x7E18_0C08, // v_cvt_f32_u32 v12, s8
         0x7E1A_0C09, // v_cvt_f32_u32 v13, s9
+    ];
+    strip_mesh([STRIP_THREAD, &words].concat(), false)
+}
+
+/// Finish the strip with vertex positions and indices. A rotated triangle
+/// has the same coverage with its last vertex moved to the provoking slot.
+fn strip_mesh(mut words: Vec<u32>, rotate: bool) -> NativeProgram {
+    words.extend([
         0x2C0A_0081, // v_lshrrev_b32 v5, 1, v0
         0x7E0A_0D05, // v_cvt_f32_u32 v5, v5
         0x100A_0AFF,
@@ -401,15 +413,28 @@ fn drawn_mesh() -> NativeProgram {
         0x0D0C_0B0A, // exp param0, v10, v11, v12, v13
         0x4A1C_0081, // v_add_nc_u32 v14, 1, v0
         0x4A1E_0082, // v_add_nc_u32 v15, 2, v0
-        0xD76F_0009,
-        0x0401_150E, // v_lshl_or_b32 v9, v14, 10, v0
-        0xD76F_0009,
-        0x0425_290F, // v_lshl_or_b32 v9, v15, 20, v9
+    ]);
+    if rotate {
+        words.extend([
+            0xD76F_0009,
+            0x043D_1500, // v_lshl_or_b32 v9, v0, 10, v15
+            0xD76F_0009,
+            0x0425_290E, // v_lshl_or_b32 v9, v14, 20, v9
+        ]);
+    } else {
+        words.extend([
+            0xD76F_0009,
+            0x0401_150E, // v_lshl_or_b32 v9, v14, 10, v0
+            0xD76F_0009,
+            0x0425_290F, // v_lshl_or_b32 v9, v15, 20, v9
+        ]);
+    }
+    words.extend([
         0x7D82_00FF,
         0x0000_007D, // v_cmp_lt_u32 vcc, lit(125), v0
         0x7E20_7081, // v_bfrev_b32 v16, 1 (the null primitive)
         0x0212_2109, // v_cndmask_b32 v9, v9, v16, vcc
-    ];
+    ]);
     let mut p = mesh(&words, 128, 0);
     let StageIo::Ms(ms) = &mut p.io else {
         unreachable!()
@@ -617,6 +642,71 @@ fn wave64_mesh_reads_draw_the_console_waves_values() {
         texels.len(),
         wrong[..wrong.len().min(16)].join("\n")
     );
+}
+
+/// Each thread picks its own VGPR from 128 distinct values. Only the
+/// threads whose attributes the draw samples enter the waterfall.
+fn drawn_index_waterfall(rotate: bool) -> NativeProgram {
+    let mut words = STRIP_THREAD.to_vec();
+    for i in 0..128 {
+        words.extend([
+            0x7E00_02FF | ((32 + i) << 17), // v_mov_b32 v[32 + i], lit
+            1000 + 3 * i,
+        ]);
+    }
+    words.extend([
+        if rotate { 0x7D86_00FF } else { 0x7D88_00FF },
+        if rotate { 2 } else { 126 }, // vcc: thread >= 2 or thread < 126
+        0xBE8A_246A,                  // s_and_saveexec_b64 s[10:11], vcc
+        0xBF88_000A,                  // s_cbranch_execz to the outer restore
+        0xBE8C_047E,                  // s_mov_b64 s[12:13], exec
+        0x7E08_0500,                  // v_readfirstlane_b32 s4, v0
+        0x7D84_0004,                  // v_cmp_eq_u32 vcc, s4, v0
+        0xBEEA_246A,                  // s_and_saveexec_b64 vcc, vcc
+        0xBEFC_0304,                  // s_mov_b32 m0, s4
+        0x7E14_8720,                  // v_movrels_b32 v10, v32
+        0x89FE_6A7E,                  // s_xor_b64 exec, exec, vcc
+        0xBF89_FFF9,                  // s_cbranch_execnz to the read
+        0xBEFE_040C,                  // s_mov_b64 exec, s[12:13]
+        0x7E14_0D0A,                  // v_cvt_f32_u32 v10, v10
+        RESTORE_EXEC,
+    ]);
+    let mut p = strip_mesh(words, rotate);
+    p.vgprs = 160;
+    p
+}
+
+#[test]
+fn vgpr_index_waterfall_translates_inside_a_divergent_mesh_branch() {
+    let p = drawn_index_waterfall(false);
+    let (_, ops) = translate_flat_mesh(&p, NVIDIA);
+    assert!(!ops.contains("waveReadLaneFirst"), "{ops}");
+    assert!(!ops.contains("barrier"), "{ops}");
+    let (_, ops) = translate_flat_mesh(&p, RDNA);
+    assert!(ops.contains("waveReadLaneFirst"), "{ops}");
+}
+
+#[test]
+fn vgpr_index_waterfall_draws_each_lanes_own_value_on_warp() {
+    let Some(host) = Host::test_warp() else {
+        return;
+    };
+    for rotate in [false, true] {
+        let p = drawn_index_waterfall(rotate);
+        let (target, ops, texels) = draw_flat_on(&host, &p, (63, 2));
+        assert!(!target.runs(64), "{target:?}");
+        assert!(!ops.contains("waveReadLaneFirst"), "{ops}");
+        assert!(!ops.contains("barrier"), "{ops}");
+        assert_eq!(texels.len(), 126);
+        for (n, texel) in texels.into_iter().enumerate() {
+            let thread = 2 * (n % 63) + n / 63 + 2 * usize::from(rotate);
+            assert_eq!(
+                texel,
+                [(1000 + 3 * thread) as f32, 0.0, 0.0, 0.0],
+                "thread {thread}"
+            );
+        }
+    }
 }
 
 /// The loop limit's drain (`lower/flow.rs`: lanes the limit ends keep

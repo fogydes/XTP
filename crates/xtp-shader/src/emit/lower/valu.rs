@@ -841,6 +841,17 @@ impl<'a> Lower<'a> {
                 let a = s(self, 0)?;
                 int(self, a)
             }
+            "v_readfirstlane_b32"
+                if self.mesh_halves()
+                    && inst
+                        .writes
+                        .first()
+                        .is_some_and(|w| self.x.res.waterfall.indices.contains(&w.1)) =>
+            {
+                // Every lane uses its own VGPR index in the proven loop.
+                let a = s(self, 0)?;
+                int(self, a)
+            }
             "v_readfirstlane_b32" if self.mesh_halves() => {
                 // The console wave's first lane, which the host wave may not
                 // hold: through group-shared memory (`mesh.rs`).

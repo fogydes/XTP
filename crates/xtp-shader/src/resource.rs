@@ -14,7 +14,7 @@
 
 use crate::ShaderError;
 use crate::gfx10::{Fields, NULL, Operand};
-use crate::ir::{EXEC, Exit, Inst, Program, Reg, Value};
+use crate::ir::{EXEC, Exit, Inst, M0, Program, Reg, Value};
 use crate::native::{HwStage, RootParam, RootType};
 use crate::structure::{Atom, Bool, LaneExit, Structured};
 
@@ -158,6 +158,9 @@ pub struct Waterfall {
     /// Descriptor loads at a table offset among `reads` (the console
     /// compiler's form): each lane loads its own entry.
     pub loads: Vec<Site>,
+    /// First-lane reads serving only a VGPR-index waterfall. Mesh programs
+    /// on hosts without 64-lane waves can use each lane's own index.
+    pub indices: Vec<Value>,
 }
 
 /// Traces every descriptor and scalar address of `p`, which runs as
@@ -210,6 +213,7 @@ fn trace(mut t: Tracer<'_>) -> Result<Resources, ShaderError> {
     // and loads that entry: accesses, offset reads and loads by block.
     let mut offset_at =
         std::collections::BTreeMap::<usize, (Vec<usize>, Vec<Value>, Vec<Site>)>::new();
+    let mut index_at = std::collections::BTreeMap::<usize, (Vec<usize>, Vec<Value>)>::new();
     for (b, block) in p.blocks.iter().enumerate() {
         for (i, inst) in block.insts.iter().enumerate() {
             let site = (b, i);
@@ -291,6 +295,21 @@ fn trace(mut t: Tracer<'_>) -> Result<Resources, ShaderError> {
                     loads.push(load);
                 }
             }
+            if t.stage == HwStage::Ms
+                && p.wave64
+                && matches!(
+                    inst.name(),
+                    "v_movrels_b32" | "v_movreld_b32" | "v_movrelsd_b32"
+                )
+                && let Some(m0) = inst.read(Reg::S(M0))
+                && let Term::Value(v) = t.origin(m0)
+                && t.first_lane_source(v).is_some()
+                && t.defs[v.0 as usize].is_some_and(|site| site.0 == b)
+            {
+                let (accesses, reads) = index_at.entry(b).or_default();
+                accesses.push(i);
+                reads.push(v);
+            }
         }
     }
     // The proof needs the per-lane form. Without it nothing is emitted, and
@@ -319,6 +338,13 @@ fn trace(mut t: Tracer<'_>) -> Result<Resources, ShaderError> {
             out.waterfall.compares.extend(proof.compares);
             out.waterfall.reads.extend(proof.reads);
             out.waterfall.loads.extend(loads);
+        }
+    }
+    for (block, (accesses, mut reads)) in index_at {
+        reads.sort_unstable();
+        reads.dedup();
+        if t.index_waterfall(block, &accesses, &reads).is_some() {
+            out.waterfall.indices.extend(reads);
         }
     }
     Ok(out)
@@ -2584,6 +2610,114 @@ impl<'a> Tracer<'a> {
         Ok(out)
     }
 
+    /// Proves the VGPR-index loop and confines its scalar results to the
+    /// loop. The moves perform all observable per-lane work, once per lane.
+    fn index_waterfall(&self, b: usize, accesses: &[usize], reads: &[Value]) -> Option<()> {
+        let proof = self.waterfall(b, accesses, reads).ok()?;
+        let insts = &self.p.blocks[b].insts;
+        let [body @ .., retry, _branch] = &insts[..] else {
+            return None;
+        };
+        let read_origin = |v| match self.origin(v) {
+            Term::Value(v) if reads.contains(&v) => Some(v),
+            _ => None,
+        };
+        let is_exec = |r| matches!(r, Reg::S(s) if s == EXEC || s == EXEC + 1);
+        if retry.name() != "s_xor_b64"
+            || retry.write(Reg::S(EXEC)).is_none()
+            || retry.reads.iter().any(|&(_, v)| read_origin(v).is_some())
+        {
+            return None;
+        }
+
+        let mut temps = std::collections::HashSet::new();
+        let mut narrowed = false;
+        for (i, inst) in body.iter().enumerate() {
+            let uses_index = |(_, v)| read_origin(v).is_some();
+            let uses_mask_temp = |&(_, v)| temps.contains(&v) && read_origin(v).is_none();
+            let writes_exec = inst.writes.iter().any(|&(r, _)| is_exec(r));
+            match inst.name() {
+                "v_readfirstlane_b32"
+                    if !narrowed && !writes_exec && inst.writes.iter().copied().all(uses_index) => {
+                }
+                "s_mov_b32" | "s_mov_b64"
+                    if !writes_exec
+                        && inst.writes.iter().enumerate().all(|(k, &w)| {
+                            uses_index(w)
+                                && matches!(copy_source(inst, k), Some(Moved::Value(v))
+                                    if read_origin(v).is_some())
+                        }) => {}
+                "s_and_saveexec_b64"
+                    if !narrowed && !inst.reads.iter().copied().any(uses_index) =>
+                {
+                    narrowed = true;
+                }
+                _ if !narrowed
+                    && !writes_exec
+                    && proof.compares.contains(&(b, i))
+                    && self.index_compare(inst, read_origin) => {}
+                _ if narrowed
+                    && accesses.contains(&i)
+                    && matches!(&inst.fields, Fields::Valu(f)
+                        if f.abs == 0 && f.neg == 0 && f.dpp.is_none() && f.sdwa.is_none())
+                    && !inst.reads.iter().any(uses_mask_temp)
+                    && inst
+                        .reads
+                        .iter()
+                        .all(|&(r, v)| r == Reg::S(M0) || read_origin(v).is_none()) => {}
+                "s_nop" => {}
+                _ => return None,
+            }
+            temps.extend(inst.writes.iter().filter_map(|&(r, v)| {
+                (matches!(r, Reg::S(_) | Reg::Scc) && !is_exec(r)).then_some(v)
+            }));
+        }
+        // SCC from the retry and the saved masks are temporary too. EXEC
+        // carries the remaining lanes, as checked by the waterfall proof.
+        temps.extend(
+            retry
+                .writes
+                .iter()
+                .filter_map(|&(r, v)| (!is_exec(r)).then_some(v)),
+        );
+        self.p
+            .blocks
+            .iter()
+            .enumerate()
+            .all(|(at, block)| {
+                block
+                    .phis
+                    .iter()
+                    .all(|p| p.args.iter().all(|a| !temps.contains(a)))
+                    && (at == b
+                        || block
+                            .insts
+                            .iter()
+                            .all(|i| i.reads.iter().all(|(_, v)| !temps.contains(v))))
+            })
+            .then_some(())
+    }
+
+    /// Requires the same VGPR value on both sides, even if two different
+    /// VGPR copies have the same origin but ran under different masks.
+    fn index_compare(&self, inst: &Inst, origin: impl Fn(Value) -> Option<Value>) -> bool {
+        let Fields::Valu(v) = &inst.fields else {
+            return false;
+        };
+        let pair = |index, own| match (index, own) {
+            (Operand::Scalar { code, dwords: 1 }, Operand::Vector { reg, dwords: 1 }) => {
+                let source = inst
+                    .read(Reg::S(code))
+                    .and_then(&origin)
+                    .and_then(|v| self.first_lane_source(v));
+                source.is_some() && source == inst.read(Reg::V(reg))
+            }
+            _ => false,
+        };
+        let [a, c] = v.src[..] else { return false };
+        matches!(inst.name(), "v_cmp_eq_u32" | "v_cmp_eq_i32") && (pair(a, c) || pair(c, a))
+    }
+
     /// Consecutive dwords of one scalar load.
     fn loaded(&self, words: &[Term]) -> Option<Source> {
         let Term::Value(v0) = words[0] else {
@@ -4401,6 +4535,66 @@ pub(crate) mod tests {
         0x887E_177E, // 0xd0: s_or_b32 exec_lo, exec_lo, s23
         0xBF81_0000, // s_endpgm
     ];
+
+    #[test]
+    fn vgpr_index_waterfalls_require_a_local_index_and_matching_lanes() {
+        let words = [
+            0xBE8A_047E_u32, // s_mov_b64 s[10:11], exec
+            0x7E08_0500,     // v_readfirstlane_b32 s4, v0
+            0x7D84_0004,     // v_cmp_eq_u32 vcc, s4, v0
+            0xBEEA_246A,     // s_and_saveexec_b64 vcc, vcc
+            0xBE85_0304,     // s_mov_b32 s5, s4
+            0xBEFC_0305,     // s_mov_b32 m0, s5
+            0x7E12_870C,     // v_movrels_b32 v9, v12
+            0x89FE_6A7E,     // s_xor_b64 exec, exec, vcc
+            0xBF89_FFF8,     // s_cbranch_execnz to the read
+            0xBEFE_040A,     // s_mov_b64 exec, s[10:11]
+            0xBF81_0000,     // s_endpgm
+        ];
+        let analyze = |words: &[u32], stage| {
+            let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+            let p = crate::ir::build(&code, true, 16).unwrap();
+            let r = track(&p, &[], stage, lanes(&p).as_ref()).unwrap();
+            assert!(r.waterfall.compares.is_empty());
+            assert!(r.waterfall.reads.is_empty());
+            assert!(r.waterfall.loads.is_empty());
+            let read = p.blocks[1].insts[0].write(Reg::S(4)).unwrap();
+            (r.waterfall.indices, read)
+        };
+        for mov in [0x7E12_870C, 0x7E12_850C, 0x7E12_890C] {
+            let mut variant = words;
+            variant[6] = mov; // Relative source, destination, or both.
+            let (indices, read) = analyze(&variant, HwStage::Ms);
+            assert_eq!(indices, [read]);
+        }
+        assert!(analyze(&words, HwStage::Cs).0.is_empty());
+
+        let mut wrong_compare = words;
+        wrong_compare[2] = 0x7D84_0204; // Compare with v1 instead.
+        let mut live_out = words.to_vec();
+        live_out.insert(10, 0x7E14_0205); // Copy s5 after EXEC has been restored.
+        let mut split = words.to_vec();
+        split.insert(2, 0xBF82_0000); // Jump to a second block before the compare.
+        split[9] = 0xBF89_FFF7;
+        let mut extra_work = words.to_vec();
+        extra_work.insert(2, 0x4A04_0481); // Increment v2 before EXEC is narrowed.
+        extra_work[9] = 0xBF89_FFF7;
+        let mut late_copy = words.to_vec();
+        late_copy.insert(8, 0xBE86_0305); // Copy the index after narrowing EXEC for the retry.
+        late_copy[9] = 0xBF89_FFF7;
+        let mut live_scc = words.to_vec();
+        live_scc.insert(10, 0x8506_8081); // s_cselect_b32 s6, 1, 0 reads the retry's SCC.
+        for (name, variant) in [
+            ("wrong compare", &wrong_compare[..]),
+            ("live out", &live_out),
+            ("two blocks", &split),
+            ("extra work", &extra_work),
+            ("late copy", &late_copy),
+            ("live SCC", &live_scc),
+        ] {
+            assert!(analyze(variant, HwStage::Ms).0.is_empty(), "{name}");
+        }
+    }
 
     fn waterfall(words: &[u32], wave64: bool) -> Result<Resources, ShaderError> {
         let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();

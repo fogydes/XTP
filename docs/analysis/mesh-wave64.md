@@ -124,6 +124,12 @@ On a host without 64-lane waves:
 
 - **Proven** (the group's or the wave's): the lane's own value. Correct for
   any host wave, in any layout of the group's threads; no wave operation.
+- A **proven VGPR-index waterfall** lets each lane use its own index when
+  the first-lane read supplies M0 through local copies. The single-block
+  loop must select precisely the lanes with the matching index and retry
+  precisely the others. Only the indexed moves do per-lane work, and the
+  scalar index and mask temporaries stay inside the loop. Every active
+  lane then passes the compare and performs its move once, in one pass.
 - **Otherwise, where the block's control level is the group's**: an
   exchange in two group-shared dwords per console wave (after the
   program's LDS; the container's group-shared size counts them).
@@ -336,6 +342,21 @@ no program changed. The one-wave LDS rule changes nothing for the pack
 either on hosts of smaller waves: its five mesh programs with LDS have 128
 lanes.
 
+**VGPR-index waterfalls for issue #56** use the validated 32-32 survey
+as the baseline.
+
+| | Before (`e2298b0`) | After |
+|---|---:|---|
+| MS programs | 9,282 | Unmeasured |
+| MS programs translated | 9,213 | Unmeasured |
+| MS programs refused at a divergent first-lane read | 15 | Unmeasured |
+
+Four of the 15 baseline refusals have the single-block shape now proven
+by resource tracking (`45f081396c2c59ba`, `c89489afd89ee7f0`,
+`0bd4d80ad23b106b`, `63083c777948927a`). Synthetic tests cover translation
+and per-lane selection. A second survey is still needed for the counts,
+validator verdicts and output hash comparison.
+
 ## 6. World sessions
 
 Series S, `E:\tools\stall-probe\session.ps1`, autopilot from the golden
@@ -424,8 +445,10 @@ captures at `E:\xtp-data\runs\frames-mesh*`. All three ran the same binary
   wave64 compute program on NVIDIA still reads its host wave's first lane.
   The proof could tell those that need the console flow; the routing is in
   `lower/mod.rs` (`Lower::new`).
-- **Value waterfalls** (the 11 programs of §5): a proof that a read's
-  result only feeds compares with its own source and work under them.
+- The **VGPR-index waterfall** proof for issue #56 covers a single block
+  with local scalar temporaries and moves selected by index equality.
+  The other 11 first-lane refusals in the `e2298b0` survey have different
+  shapes (§5).
 - **A lane stopped by the loop limit** (`LOOP_LIMIT`) leaves the program.
   If a group barrier follows, the other lanes wait for it: a hang where
   the console would only have been slow. The title's mesh programs that
