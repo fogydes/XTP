@@ -25,6 +25,16 @@ Shaders are translated when the title creates a pipeline, from the bytes it
 passes, wherever it loaded them from (executable, archive, memory).
 Converting them ahead of time from files is only a warm-up.
 
+## GPU submission preparation and completion
+
+With `XTP_WIDE=1`, GPU preparation and completion share a scoped worker pool.
+The submission thread groups disjoint refresh intervals by shadow and batches
+independent fills and texture refreshes between deferred steps. After the GPU
+fence passes, the pool compares system-memory shadow ranges against their
+preimages in jobs of up to 1 MiB. The completion thread merges changed pieces
+in submission order, preserving title writes and lazy copy-back for mapped
+views. AVX2 comparisons are selected at runtime where supported.
+
 ## Crates
 
 | Crate | Role |

@@ -628,6 +628,25 @@ impl Kernel {
             list.list.ResourceBarrier(&[crate::host::uav_barrier()]);
         }
     }
+
+    /// Records a [`Pass::Fill`] dispatch directly into `dst` at title address
+    /// `at` without deferring refreshes or copy-backs, so tests can control
+    /// snapshot, title writes, and copy-back explicitly.
+    pub(crate) fn dispatch_fill_raw(&self, list: &HostList, dst: &Shadow, at: u64) {
+        list.keep(&self.root);
+        list.keep(&self.pso);
+        // SAFETY: an open list, live pipeline/signature kept on the list, and
+        // valid GPU virtual address inside `dst`.
+        unsafe {
+            list.list.SetComputeRootSignature(&self.root);
+            list.list.SetPipelineState(&self.pso);
+            list.list.SetComputeRoot32BitConstant(0, 0, 0);
+            list.list.SetComputeRootUnorderedAccessView(1, dst.gpu(at));
+            list.list.SetComputeRootUnorderedAccessView(2, dst.gpu(at));
+            list.list.Dispatch(1, 1, 1);
+            list.list.ResourceBarrier(&[crate::host::uav_barrier()]);
+        }
+    }
 }
 
 #[cfg(test)]

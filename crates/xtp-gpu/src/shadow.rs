@@ -60,7 +60,7 @@
 //! shader writes are done; the debug layer may report the state.
 
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use windows::Win32::Graphics::Direct3D12::*;
@@ -416,9 +416,16 @@ impl Before {
 
     /// The snapshot's bytes of `[from, to)` (offsets), if it took them.
     fn bytes(&mut self, from: usize, to: usize) -> Option<&mut [u8]> {
+        self.has_bytes(from, to)
+            .then(|| &mut self.mirror.bytes[from..to])
+    }
+
+    /// Whether the snapshot covers `[from, to)` (offsets).
+    fn has_bytes(&self, from: usize, to: usize) -> bool {
         let i = self.taken.partition_point(|&(_, end)| end < to);
-        let &(at, end) = self.taken.get(i)?;
-        (at <= from && to <= end).then(|| &mut self.mirror.bytes[from..to])
+        self.taken
+            .get(i)
+            .is_some_and(|&(at, end)| at <= from && to <= end)
     }
 }
 
@@ -589,7 +596,10 @@ impl Shadow {
     fn inside(&self, address: usize, len: usize) -> (usize, usize) {
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let from = address.clamp(start, end);
-        (from - start, (address + len).clamp(from, end) - start)
+        (
+            from - start,
+            address.saturating_add(len).clamp(from, end) - start,
+        )
     }
 
     /// Shaders of `list` may write `[address, address + len)` of the copy
@@ -740,6 +750,16 @@ impl Shadow {
     /// declared: they are done with once it is back. Returns the bytes
     /// written.
     pub(crate) fn copy_back(&self, submission: u64, address: usize, len: usize) -> usize {
+        self.copy_back_with(submission, address, len, None)
+    }
+
+    fn copy_back_with(
+        &self,
+        submission: u64,
+        address: usize,
+        len: usize,
+        changed: Option<&[AtomicBool]>,
+    ) -> usize {
         if let Some(card) = &self.card {
             return self.card_back(card, submission, address, len);
         }
@@ -765,8 +785,15 @@ impl Shadow {
             // range alone until this submission has finished.
             let host =
                 |a: usize, b: usize| unsafe { std::slice::from_raw_parts(self.data.add(a), b - a) };
-            let differs =
-                |before: &[u8], a: usize, b: usize| host(a, b) != &before[a - from..b - from];
+            let differs = |before: &[u8], a: usize, b: usize| {
+                if let Some(changed) = changed {
+                    changed[(start + a) / PIECE - (start + from) / PIECE].load(Ordering::Relaxed)
+                } else if crate::workers::wide() {
+                    crate::compare::differ(host(a, b), &before[a - from..b - from])
+                } else {
+                    host(a, b) != &before[a - from..b - from]
+                }
+            };
             #[cfg(any(test, feature = "diagnostics"))]
             let census = census::before_back(submission, start + from, start + to, || {
                 self.census_view(start + from)
@@ -810,10 +837,12 @@ impl Shadow {
             #[cfg(feature = "diagnostics")]
             {
                 use crate::copystat::{C, add};
-                add(
-                    C::BackScanNs,
-                    scan_start.elapsed().saturating_sub(merging).as_nanos() as u64,
-                );
+                if changed.is_none() {
+                    add(
+                        C::BackScanNs,
+                        scan_start.elapsed().saturating_sub(merging).as_nanos() as u64,
+                    );
+                }
                 add(C::BackCompared, (to - from) as u64);
                 // By kind of copy, to tell which would gain from the card:
                 // windows of loose memory, then title buffers by size.
@@ -867,7 +896,7 @@ impl Shadow {
         }
         // Every step of the submission that declared a range in it is done
         // with it, and the submission's snapshot with its last range.
-        let end = address + len;
+        let end = address.saturating_add(len);
         let mut busy = self.busy();
         busy.retain(|b| {
             !(b.shaders && b.submission == submission && address <= b.from && b.to <= end)
@@ -1148,38 +1177,60 @@ impl Shadow {
     /// and the copy-back comes late (once the submission has finished).
     fn write_gpu_runs(&self, at: usize, host: &mut [u8], old: &[u8], title: &[u8]) -> usize {
         let (mut written, mut opened) = (0, false);
-        let mut i = 0;
-        while i < host.len() {
-            let run = first_change(host, old, i);
-            host[i..run].copy_from_slice(&title[i..run]);
-            if run == host.len() {
-                break;
-            }
-            i = first_same(host, old, run);
-            // In the run the GPU changed: the parts the title left alone go
-            // back, those it wrote stay its own (and the copy takes them).
-            let (title_run, old_run) = (&title[..i], &old[..i]);
-            let mut j = run;
-            while j < i {
-                let theirs = first_change(title_run, old_run, j);
-                if theirs > j {
-                    if !opened {
-                        // The piece's guard, once.
-                        crate::watch::writing(at, host.len());
-                        opened = true;
+        let piece_len = host.len();
+        let merge_span =
+            |from: usize, end: usize, host: &mut [u8], written: &mut usize, opened: &mut bool| {
+                let mut i = from;
+                while i < end {
+                    let run = first_change(&host[..end], &old[..end], i);
+                    host[i..run].copy_from_slice(&title[i..run]);
+                    if run == end {
+                        break;
                     }
-                    write_title(at + j, host[j..].as_ptr(), theirs - j);
-                    written += theirs - j;
-                    #[cfg(any(test, feature = "diagnostics"))]
-                    census::wrote(at + j, theirs - j);
-                    #[cfg(feature = "diagnostics")]
-                    crate::copystat::add(crate::copystat::C::BackRuns, 1);
+                    i = first_same(&host[..end], &old[..end], run);
+                    // In the run the GPU changed: the parts the title left alone go
+                    // back, those it wrote stay its own (and the copy takes them).
+                    let (title_run, old_run) = (&title[..i], &old[..i]);
+                    let mut j = run;
+                    while j < i {
+                        let theirs = first_change(title_run, old_run, j);
+                        if theirs > j {
+                            if !*opened {
+                                // The piece's guard, once.
+                                crate::watch::writing(at, piece_len);
+                                *opened = true;
+                            }
+                            write_title(at + j, host[j..].as_ptr(), theirs - j);
+                            *written += theirs - j;
+                            #[cfg(any(test, feature = "diagnostics"))]
+                            census::wrote(at + j, theirs - j);
+                            #[cfg(feature = "diagnostics")]
+                            crate::copystat::add(crate::copystat::C::BackRuns, 1);
+                        }
+                        j = first_same(title_run, old_run, theirs);
+                        host[theirs..j].copy_from_slice(&title[theirs..j]);
+                        #[cfg(feature = "diagnostics")]
+                        crate::copystat::add(crate::copystat::C::BackKept, (j - theirs) as u64);
+                    }
                 }
-                j = first_same(title_run, old_run, theirs);
-                host[theirs..j].copy_from_slice(&title[theirs..j]);
-                #[cfg(feature = "diagnostics")]
-                crate::copystat::add(crate::copystat::C::BackKept, (j - theirs) as u64);
+            };
+        if once() && crate::workers::wide() {
+            thread_local! {
+                static RUNS: std::cell::RefCell<Vec<(usize, usize)>> =
+                    const { std::cell::RefCell::new(Vec::new()) };
             }
+            RUNS.with_borrow_mut(|runs| {
+                crate::compare::word_runs(at, host, old, runs);
+                let mut cursor = 0;
+                for &(from, len) in runs.iter() {
+                    host[cursor..from].copy_from_slice(&title[cursor..from]);
+                    merge_span(from, from + len, host, &mut written, &mut opened);
+                    cursor = from + len;
+                }
+                host[cursor..].copy_from_slice(&title[cursor..]);
+            });
+        } else {
+            merge_span(0, piece_len, host, &mut written, &mut opened);
         }
         written
     }
@@ -1456,6 +1507,9 @@ impl Shadow {
 /// (`world_frame_copies_cost`). A byte at a time as before W1
 /// (`XTP_SHADOW_ONCE=0`).
 fn first_change(a: &[u8], b: &[u8], mut at: usize) -> usize {
+    if once() && crate::workers::wide() {
+        return crate::compare::first_change(a, b, at);
+    }
     if once() {
         while at + 8 <= a.len() {
             let x = word(a, at) ^ word(b, at);
@@ -1474,6 +1528,9 @@ fn first_change(a: &[u8], b: &[u8], mut at: usize) -> usize {
 /// The first offset from `at` where `a` and `b` are the same (their length
 /// if none), 8 bytes at a time as [`first_change`].
 fn first_same(a: &[u8], b: &[u8], mut at: usize) -> usize {
+    if once() && crate::workers::wide() {
+        return crate::compare::first_same(a, b, at);
+    }
     const ONES: u64 = u64::from_le_bytes([1; 8]);
     const HIGHS: u64 = u64::from_le_bytes([0x80; 8]);
     if once() {
@@ -1499,6 +1556,127 @@ fn word(bytes: &[u8], at: usize) -> u64 {
     let mut w = [0; 8];
     w.copy_from_slice(&bytes[at..at + 8]);
     u64::from_le_bytes(w)
+}
+
+/// Copies back shader-written ranges after their GPU fence has passed.
+pub(crate) fn copy_back_all(submission: u64, back: &[(Arc<Shadow>, usize, usize)]) -> usize {
+    copy_back_all_with(submission, back, crate::workers::wide())
+}
+
+pub(crate) fn copy_back_all_with(
+    submission: u64,
+    back: &[(Arc<Shadow>, usize, usize)],
+    wide: bool,
+) -> usize {
+    if !wide || back.is_empty() {
+        return back
+            .iter()
+            .map(|(shadow, address, len)| shadow.copy_back(submission, *address, *len))
+            .sum();
+    }
+    #[cfg(feature = "diagnostics")]
+    let started = std::time::Instant::now();
+    let found = find_pieces(submission, back);
+    #[cfg(feature = "diagnostics")]
+    if !found.bits.is_empty() {
+        crate::copystat::add(
+            crate::copystat::C::BackScanNs,
+            started.elapsed().as_nanos() as u64,
+        );
+    }
+    // Keep completion order even for distinct title virtual addresses: two
+    // views can map the same physical page. Card ranges already have a GPU
+    // comparison and use the same ordered landing loop.
+    back.iter()
+        .zip(found.ranges)
+        .map(|((shadow, address, len), range)| {
+            let changed = (!range.is_empty()).then(|| &found.bits[range]);
+            shadow.copy_back_with(submission, *address, *len, changed)
+        })
+        .sum()
+}
+
+struct ChangedPieces {
+    ranges: Vec<std::ops::Range<usize>>,
+    bits: Vec<AtomicBool>,
+}
+
+/// Finds changed 64 KiB pieces before landing. Jobs compare up to 1 MiB
+/// apiece. The caller holds the snapshot guards and workers read slices.
+fn find_pieces(submission: u64, back: &[(Arc<Shadow>, usize, usize)]) -> ChangedPieces {
+    use std::sync::TryLockError;
+    let mut indices: Vec<_> = (0..back.len()).collect();
+    let key = |&i: &usize| (Arc::as_ptr(&back[i].0), back[i].1);
+    if !indices.is_sorted_by_key(key) {
+        indices.sort_unstable_by_key(key);
+    }
+    let mut locked = Vec::new();
+    for group in indices.chunk_by(|&a, &b| Arc::ptr_eq(&back[a].0, &back[b].0)) {
+        let shadow = &back[group[0]].0;
+        if shadow.carded()
+            || group.windows(2).any(|pair| {
+                let (_, address, len) = back[pair[0]];
+                address.saturating_add(len) > back[pair[1]].1
+            })
+        {
+            // Landing an earlier overlapping range changes a later range's
+            // preimage. Compare those ranges as they land.
+            continue;
+        }
+        let snapshots = match shadow.before.try_lock() {
+            Ok(guard) => guard,
+            Err(TryLockError::Poisoned(e)) => e.into_inner(),
+            Err(TryLockError::WouldBlock) => continue,
+        };
+        locked.push((group, snapshots));
+    }
+
+    let mut ranges = vec![0..0; back.len()];
+    let mut total = 0;
+    let mut scans = Vec::new();
+    for (group, snapshots) in &locked {
+        let Some(snapshot) = snapshots.live.iter().find(|b| b.submission == submission) else {
+            continue;
+        };
+        for &i in *group {
+            let (shadow, address, len) = &back[i];
+            let (from, to) = shadow.inside(*address, *len);
+            if from == to || !snapshot.has_bytes(from, to) {
+                continue;
+            }
+            let start = shadow.start as usize + from;
+            let count = (shadow.start as usize + to).div_ceil(PIECE) - start / PIECE;
+            ranges[i] = total..total + count;
+            total += count;
+            // SAFETY: the declaration covers this mapped range. Its GPU
+            // fence has passed, refreshes skip busy bytes, and the timeline
+            // excludes overlapping GPU writers and completions through this
+            // copy until the range lands. The Arc owns the mapping and the
+            // guard holds the preimage until all scoped jobs have finished.
+            let host = unsafe { std::slice::from_raw_parts(shadow.data.add(from), to - from) };
+            scans.push((i, start, host, &snapshot.mirror.bytes[from..to]));
+        }
+    }
+
+    let bits: Vec<_> = (0..total).map(|_| AtomicBool::new(false)).collect();
+    let mut pieces = Vec::with_capacity(total);
+    for (i, start, host, before) in scans {
+        let mut from = 0;
+        for out in &bits[ranges[i].clone()] {
+            let to = from + (PIECE - (start + from) % PIECE).min(host.len() - from);
+            pieces.push((&host[from..to], &before[from..to], out));
+            from = to;
+        }
+    }
+    const PIECES_PER_JOB: usize = (1 << 20) / PIECE;
+    crate::workers::each_wide(pieces.len().div_ceil(PIECES_PER_JOB), &|job| {
+        let from = job * PIECES_PER_JOB;
+        let to = (from + PIECES_PER_JOB).min(pieces.len());
+        for &(host, before, out) in &pieces[from..to] {
+            out.store(crate::compare::differ(host, before), Ordering::Relaxed);
+        }
+    });
+    ChangedPieces { ranges, bits }
 }
 
 /// The copy-back's unit: title memory is compared, read and written back
@@ -5321,7 +5499,7 @@ mod tests {
 
     impl Shadow {
         /// The copy's bytes at title addresses `[at, at + len)`.
-        pub(super) fn host_bytes(&self, at: usize, len: usize) -> Vec<u8> {
+        pub(crate) fn host_bytes(&self, at: usize, len: usize) -> Vec<u8> {
             let from = at - self.start as usize;
             assert!(from + len <= self.len as usize);
             // SAFETY: inside the mapping.
@@ -5526,7 +5704,7 @@ mod tests {
                     let id = submission();
                     s.writing_by(id, address, PAGE, 123);
                     s.set_host(address + 7, 1, byte);
-                    s.copy_back(id, address, PAGE)
+                    copy_back_all_with(id, &[(s.clone(), address, PAGE)], true)
                 };
                 if previous.is_some() {
                     // A new process, with fresh virtual addresses and no live
@@ -5587,6 +5765,33 @@ mod tests {
                 assert_eq!(publish(at + 3 * PAGE, 4), 0);
                 assert_eq!(title(private + 3 * PAGE + 7, 1), [0]);
                 assert_eq!(title(alias + 3 * PAGE + 7, 1), [4]);
+
+                // Two shadows through different virtual views can land on
+                // exactly the same byte. Give them in reverse address order.
+                register(2, alias as u64, (4 * PAGE) as u64);
+                let other = find(alias as u64, (4 * PAGE) as u64).unwrap();
+                assert!(!Arc::ptr_eq(&s, &other));
+                let _pin = crate::pin_copy_back(private, PAGE);
+                let (first, second) = if at > alias {
+                    ((&s, at + 42), (&other, alias + 42))
+                } else {
+                    ((&other, alias + 42), (&s, at + 42))
+                };
+                let id = submission();
+                for ((shadow, address), byte) in [(first, 0x31), (second, 0x42)] {
+                    shadow.update(address, 1);
+                    shadow.writing(id, address, 1);
+                    shadow.set_host(address, 1, byte);
+                }
+                let back = [
+                    (first.0.clone(), first.1, 1),
+                    (second.0.clone(), second.1, 1),
+                ];
+                assert_eq!(copy_back_all_with(id, &back, true), 1);
+                assert_eq!(title(private + 42, 1), [0x31]);
+                assert_eq!(second.0.host_bytes(second.1, 1), [0x31]);
+                drop(_pin);
+                unregister(2, alias as u64);
                 host.drain();
                 unregister(1, at as u64);
             });
@@ -7172,6 +7377,39 @@ mod tests {
         assert!(shadow.host_bytes(x, 8).iter().all(|&b| b == 0xb0));
         assert!(!shadow.stale(window, window + 2 * PAGE));
         assert_eq!(shadow.update(window, 2 * PAGE), 0);
+    }
+
+    #[test]
+    fn wide_scan_falls_back_for_overlapping_ranges_or_a_held_snapshot() {
+        let Some(_gpu) = crate::testgpu::device(
+            "wide_scan_falls_back_for_overlapping_ranges_or_a_held_snapshot",
+        ) else {
+            return;
+        };
+        let buffer = crate::testgpu::TitleBuffer::new(2 * PAGE);
+        let shadow = buffer.shadow();
+        let base = buffer.address() as usize;
+        let id = submission();
+        shadow.update(base, 2 * PAGE);
+        shadow.writing(id, base, 2 * PAGE);
+        shadow.set_host(base + PAGE - 1, 2, 0xb7);
+        let whole = [(shadow.clone(), base, 2 * PAGE)];
+        {
+            let _held = lock(&shadow.before);
+            assert!(find_pieces(id, &whole).bits.is_empty());
+        }
+        let found = find_pieces(id, &whole);
+        assert_eq!(found.bits.len(), 2);
+        assert!(found.bits.iter().all(|bit| bit.load(Ordering::Relaxed)));
+
+        let overlapping = [
+            (shadow.clone(), base + PAGE - 1, 2),
+            (shadow.clone(), base, 2 * PAGE),
+        ];
+        assert!(find_pieces(id, &overlapping).bits.is_empty());
+        assert_eq!(copy_back_all_with(id, &overlapping, true), 2);
+        assert_eq!(title(base + PAGE - 2, 4), [0, 0xb7, 0xb7, 0]);
+        assert!(shadow.busy().iter().all(|b| b.submission != id));
     }
 
     /// A title write into a page GPU work in flight writes, which the GPU
