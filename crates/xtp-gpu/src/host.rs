@@ -585,6 +585,7 @@ mod tests {
         assert_eq!(chunk_for(Some("100"), false), 128 << 10);
         assert_eq!(chunk_for(Some("4096"), true), SCRATCH_CHUNK);
         assert_eq!(chunk_for(Some("65536"), true), SCRATCH_CHUNK);
+        assert_eq!(chunk_for(Some("18446744073709551615"), true), SCRATCH_CHUNK);
     }
 
     #[test]
@@ -1098,7 +1099,7 @@ fn scratch_chunk() -> u64 {
 /// host has less than 32 GiB of RAM.
 fn chunk_for(asked: Option<&str>, low_memory: bool) -> u64 {
     match asked.map(str::trim).and_then(|v| v.parse::<u64>().ok()) {
-        Some(kib) if kib > 0 => (kib << 10).next_multiple_of(64 << 10).min(SCRATCH_CHUNK),
+        Some(kib) if kib > 0 => (kib.min(SCRATCH_CHUNK >> 10) << 10).next_multiple_of(64 << 10),
         _ if low_memory => SCRATCH_CHUNK_LOW,
         _ => SCRATCH_CHUNK,
     }
