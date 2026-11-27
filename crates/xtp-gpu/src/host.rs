@@ -17,7 +17,12 @@
 //! A present finishes every submission before it returns, unless one frame
 //! is let run on while the title prepares the next (`XTP_FRAMES_IN_FLIGHT`,
 //! [`frames`]).
+//!
+//! `XTP_CARD_AWAKE=1` ([`awake`]) runs a small compute loop on its own compute
+//! queue between submissions so the driver does not lower GPU clocks during
+//! short CPU gaps (off by default).
 
+mod awake;
 pub(crate) mod buffers;
 mod frames;
 pub(crate) mod preparation;
@@ -64,6 +69,9 @@ pub(crate) fn texture_state(state: u32) -> u32 {
 const RTV_RING: u32 = 1024;
 
 pub(crate) struct Host {
+    /// Optional background compute loop (`XTP_CARD_AWAKE=1`) kept ahead of
+    /// `device` so it shuts down and releases its GPU objects first on drop.
+    awake: Option<awake::Awake>,
     pub(crate) device: ID3D12Device,
     pub(crate) depth_bounds: bool,
     queue: ID3D12CommandQueue,
@@ -532,12 +540,14 @@ fn create(software: bool) -> windows::core::Result<Host> {
         let dsv_size = device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_DSV);
         // Heaps for buffers, made from now on by threads of their own.
         buffers::start(&device);
+        let awake = awake::Awake::start_if_enabled(&device);
         tracing::info!(
             synchronous = sync_submit(),
             depth_bounds,
             "host D3D12 device ready"
         );
         Ok(Host {
+            awake,
             device,
             depth_bounds,
             queue,
@@ -1808,6 +1818,9 @@ impl Host {
                 self.queue.ExecuteCommandLists(group);
                 self.queue.Signal(&self.fence, *submitted)
             };
+            if let Some(awake) = &self.awake {
+                awake.note_submission();
+            }
             if let Err(e) = signalled {
                 // Nothing would finish it.
                 let recorded: Vec<Recorded> = runs.iter().map(|l| l.recorded()).collect();
