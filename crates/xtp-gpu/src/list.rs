@@ -1479,6 +1479,7 @@ fn clear_uav(
                 list.twin_view_written(texture, &view);
                 list.twins_written();
                 ensure_state(list, texture, UNORDERED_ACCESS);
+                list.texture_written(texture);
                 crate::resource::decode::wrote(list, texture);
                 crate::texture::gpu_write(list, texture, false);
             }

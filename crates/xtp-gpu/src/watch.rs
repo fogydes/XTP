@@ -1308,6 +1308,7 @@ pub unsafe extern "system" fn title_virtual_protect(
 /// are opened with it. The runtime forgets it in its index once it is
 /// gone, before the report after.
 pub fn title_memory_remapped(at: usize, len: usize) {
+    crate::texback::remapped(at, len);
     crate::rt::release_buffer(None, at as u64, at.saturating_add(len) as u64);
     // Reads of title memory forget what they learned of its pages, once the
     // reads under way are done (`crate::shadow::title_changing`; before the

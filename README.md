@@ -253,6 +253,7 @@ cargo build --profile diag -p xtp --features diagnostics   # target\diag\xtp.exe
 | `XTP_CARD_AWAKE=1` | every build: keeps the host GPU's clocks up between submissions with one small compute group looping on its own compute queue, stopping after 250 ms without a submission (off by default) |
 | `XTP_DIALOGS=auto` | every build: auto-dismisses `XGameUi` message and error dialogs without opening a window (message dialogs return `cancel_button`, error dialogs complete with `S_OK`; enabled automatically under `--autopilot`; does not affect text entry) |
 | `XTP_INDIRECT_REST=1` | every build: an indirect record that does not fit in its command list's remaining budget spends the rest of it so every later record in the list runs empty too (off by default, so an oversized record runs empty and later records that fit still run) |
+| `XTP_TEXTURE_BACK=<w>x<h>f<fmt>,...` | every Windows build: tiles UAV-written textures of the listed `(width, height, dxgi_format)` kinds back into title memory once their submission completes; `1` or unset uses the known build's defaults (off for unknown builds), `0`/`off` disables it |
 
 Every build appends crashes and host GPU failures to `crashes.log` in the
 title's data folder. The loader also prints the first 16 title C++ throws

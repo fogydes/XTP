@@ -1392,6 +1392,12 @@ struct Deferred {
     submitting: Vec<Submitting>,
     /// Textures whose contents the list brings up to date.
     textures: std::collections::HashSet<usize>,
+    /// Title textures of wanted kinds ([`crate::texback`]) written by shaders
+    /// in this list, copied to readback buffers when the list closes.
+    back_wanted: Vec<crate::texback::Target>,
+    /// Readback copies recorded at close, tiled into title memory once the
+    /// submission completes.
+    texture_backs: Vec<std::sync::Arc<crate::texback::Back>>,
     /// Bottom-of-pipe writes, done once the list has run: address, what,
     /// bytes.
     writes: Vec<(usize, crate::queue::Written, usize)>,
@@ -1436,6 +1442,8 @@ struct Pending {
     /// The ranges its shaders write (host copy, address, bytes), merged
     /// per host copy.
     back: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
+    /// Compute-written texture readbacks to tile into title memory on completion.
+    texture_backs: Vec<std::sync::Arc<crate::texback::Back>>,
     /// Its bottom-of-pipe writes, in list order: address, what, bytes.
     writes: Vec<(usize, crate::queue::Written, usize)>,
     submitted: std::time::Instant,
@@ -1453,6 +1461,7 @@ impl Pending {
     fn of(runs: &[&HostList], submission: u64) -> (Pending, Touches) {
         type Ranges = Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>;
         let (mut back, mut copied): (Ranges, Ranges) = (Vec::new(), Vec::new());
+        let mut texture_backs = Vec::new();
         let (mut writes, mut touches) = (Vec::new(), Touches::default());
         // One list's lock at a time: a submission may name a list twice.
         for list in runs {
@@ -1493,6 +1502,10 @@ impl Pending {
                     _ => {}
                 }
             }
+            for back in &deferred.texture_backs {
+                texture_backs.push(back.clone());
+                touches.labels.push(back.range());
+            }
             for &(at, what, bytes) in &deferred.writes {
                 writes.push((at, what, bytes));
                 touches.labels.push((at, at + bytes));
@@ -1525,6 +1538,7 @@ impl Pending {
             submission,
             copied,
             back,
+            texture_backs,
             writes,
             submitted: std::time::Instant::now(),
             preparing: std::time::Duration::ZERO,
@@ -2271,6 +2285,10 @@ impl Host {
             let written = shadow.copy_back(p.submission, *address, *len);
             COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
         }
+        for back in &p.texture_backs {
+            let written = crate::texback::land(back);
+            COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
+        }
         let back = copying.elapsed();
         COPY_BACK[0].fetch_add(back.as_micros() as u64, Ordering::Relaxed);
         for &(at, what, bytes) in &p.writes {
@@ -2610,6 +2628,7 @@ impl HostList {
         // Depth textures whose twins the list wrote last get what was
         // written (`twins`).
         self.twins_to_depth();
+        self.textures_back();
         crate::timestamps::close(self);
         #[cfg(feature = "diagnostics")]
         crate::passdump::closed(self);
@@ -3134,6 +3153,47 @@ impl HostList {
         count: Option<&ID3D12Resource>,
     ) -> crate::indirect::Writes {
         self.deferred().indirect_writers.before(args, count)
+    }
+
+    /// Notes a title texture written through unordered access; if its kind is
+    /// configured for readback ([`crate::texback`]), the list copies it when
+    /// closing.
+    pub(crate) fn texture_written(&self, resource: crate::object::This) {
+        if !crate::texback::wanted(resource) {
+            return;
+        }
+        let mut deferred = self.deferred();
+        deferred
+            .back_wanted
+            .retain(crate::texback::Target::is_valid);
+        if !deferred
+            .back_wanted
+            .iter()
+            .any(|target| target.owner() == resource as usize)
+            && let Some(target) = crate::texback::Target::new(resource)
+        {
+            deferred.back_wanted.push(target);
+        }
+    }
+
+    /// Copies wanted shader-written textures into readback buffers before the
+    /// list closes ([`crate::texback::record`]).
+    fn textures_back(&self) {
+        if !crate::texback::tracking() {
+            return;
+        }
+        const COPY_SOURCE: u32 = 0x800;
+        let wanted = std::mem::take(&mut self.deferred().back_wanted);
+        for target in wanted {
+            let copy = target.copy.clone();
+            if let Some(back) = crate::texback::record(&self.list, target, || {
+                self.move_to(&copy, COPY_SOURCE);
+            }) {
+                self.deferred()
+                    .texture_backs
+                    .push(std::sync::Arc::new(back));
+            }
+        }
     }
 
     /// Stores `what` (`bytes` of it) at `dst` once the list has run.
@@ -3988,6 +4048,46 @@ impl Host {
             Ok(()) => Some((buffer?, data.cast())),
             Err(e) => {
                 tracing::warn!(error = %e, size, "no upload buffer");
+                None
+            }
+        }
+    }
+
+    /// A buffer of `size` bytes in the readback heap, in `COPY_DEST`.
+    pub(crate) fn read_back_buffer(&self, size: u64) -> Option<ID3D12Resource> {
+        let heap = D3D12_HEAP_PROPERTIES {
+            Type: D3D12_HEAP_TYPE_READBACK,
+            ..Default::default()
+        };
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+            Width: size.max(1),
+            Height: 1,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+            ..Default::default()
+        };
+        let mut buffer: Option<ID3D12Resource> = None;
+        // SAFETY: plain creation of a readback buffer.
+        let made = unsafe {
+            self.device.CreateCommittedResource(
+                &heap,
+                D3D12_HEAP_FLAG_NONE,
+                &desc,
+                D3D12_RESOURCE_STATE_COPY_DEST,
+                None,
+                &mut buffer,
+            )
+        };
+        match made {
+            Ok(()) => buffer,
+            Err(e) => {
+                tracing::warn!(error = %e, size, "no readback buffer");
                 None
             }
         }

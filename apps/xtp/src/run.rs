@@ -164,6 +164,9 @@ pub fn run(
         xtp_hle::modules::xmem::reserve_low_va_from_env(
             build.map_or(0, |build| build.low_va_reserve_mib),
         );
+        xtp_gpu::configure_texture_readback(
+            build.map_or(&[], |build| build.texture_readback_kinds),
+        );
     }
     match build {
         Some(build) => println!("build          {} ({hash})", build.label),

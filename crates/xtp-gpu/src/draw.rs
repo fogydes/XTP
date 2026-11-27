@@ -4105,6 +4105,7 @@ fn readable(list: &HostList, u: &UsedResource, view: &View) {
             #[cfg(feature = "diagnostics")]
             crate::passdump::written(list, *resource as This);
             crate::resource::decode::bound_uav(list, *resource as This);
+            list.texture_written(*resource as This);
             list.twin_use(*resource as This, true, true);
             // Which twin the view writes, of a depth-stencil texture's two.
             list.twin_view_written(*resource as This, view);

@@ -95,6 +95,10 @@ mod tdr;
 #[cfg(all(windows, test))]
 mod testgpu;
 #[cfg(windows)]
+mod texback;
+#[cfg(windows)]
+pub use texback::configure_texture_readback;
+#[cfg(windows)]
 mod texture;
 #[cfg(all(windows, test))]
 mod texture_commit_probe;

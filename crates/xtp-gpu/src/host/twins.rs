@@ -180,7 +180,7 @@ impl HostList {
     /// as [`HostList::transition`] does a title resource's host copy, and
     /// records the barrier: for colour twins (no title resource's copy)
     /// and the copies between a twin and its depth texture.
-    fn move_to(&self, copy: &Arc<HostTexture>, wanted: u32) {
+    pub(super) fn move_to(&self, copy: &Arc<HostTexture>, wanted: u32) {
         let wanted = super::legal_state(&copy.texture, wanted);
         let mut states = self.states.lock().unwrap_or_else(|e| e.into_inner());
         let before = match states.entry(Arc::as_ptr(copy) as usize) {

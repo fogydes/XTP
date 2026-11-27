@@ -19,6 +19,9 @@ pub struct KnownBuild {
     pub blake3: &'static str,
     /// Size of a startup placeholder that must fit below 4 GiB, in MiB.
     pub low_va_reserve_mib: usize,
+    /// Texture kinds `(width, height, dxgi_format)` written by shaders and
+    /// read back into title memory when `XTP_TEXTURE_BACK` is unset or `1`.
+    pub texture_readback_kinds: &'static [(u64, u32, u32)],
 }
 
 /// `game_scarlett_master.exe` of the Xbox Series package 1.0.2.1 (its
@@ -27,6 +30,7 @@ pub const BUILD_1_0_2_1: KnownBuild = KnownBuild {
     label: "1.0.2.1 Xbox Series",
     blake3: "b99f876b74d4a77f03af5f878223b27bd647b5c35a79d5decd9f716504239e93",
     low_va_reserve_mib: 185,
+    texture_readback_kinds: &[(256, 256, 41), (256, 256, 16), (64, 64, 16), (128, 128, 36)],
 };
 
 /// Builds we know.
