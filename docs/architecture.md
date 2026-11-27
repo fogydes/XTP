@@ -46,6 +46,14 @@ Converting them ahead of time from files is only a warm-up.
 Everything except `xtp-game` is platform-level and can be tested with
 any Xbox Series title.
 
+For the opt-in indirect-light stand-in, `xtp-game` supplies compute program
+hashes and table bindings at startup. `xtp-gpu` matches those hashes when
+it creates shaders and records its passes after the corresponding direct
+dispatches, using the views already bound by the translated shader.
+Radiance and estimate history follow execution order on the host queue.
+`XTP_RT_STANDIN` can clear a dropped trace to misses upstream, while
+`XTP_AMBIENT` works on the diffuse output of a resolve that ran.
+
 The pipeline cache uses a 1 GiB payload budget by default. Pass a byte
 budget to `Cache::open_with_limit`, or zero to disable disk access. When
 space is needed, the cache evicts entries in write-time order and skips

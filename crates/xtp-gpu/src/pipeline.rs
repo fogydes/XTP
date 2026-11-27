@@ -60,6 +60,8 @@ pub(crate) struct Shader {
     pub(crate) stage: &'static str,
     /// The first 8 bytes of its BLAKE3, as logged.
     pub(crate) hash: String,
+    #[cfg(windows)]
+    pub(crate) ambient: Option<crate::ambient::Program>,
     container: Vec<u8>,
     /// What its console program says of itself, read on first use without
     /// translating it.
@@ -89,6 +91,12 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
             Arc::new(Shader {
                 stage,
                 hash: full.to_hex()[..16].to_owned(),
+                #[cfg(windows)]
+                ambient: if stage == "compute" {
+                    crate::ambient::program(full.as_bytes())
+                } else {
+                    None
+                },
                 container: bytes.to_vec(),
                 #[cfg(windows)]
                 native: OnceLock::new(),
@@ -898,6 +906,7 @@ pub(crate) fn test_shader(stage: &'static str, host: xtp_shader::emit::HostShade
     Arc::new(Shader {
         stage,
         hash: blake3::hash(&host.dxil).to_hex()[..16].to_owned(),
+        ambient: None,
         container: Vec::new(),
         native: OnceLock::new(),
         translated: OnceLock::from(Some(Translated {

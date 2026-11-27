@@ -2213,6 +2213,17 @@ impl HostHeap {
         drop(self.swap_kept(index, resource));
     }
 
+    /// The actual resource of a host descriptor, including a freshly
+    /// remapped or placed view. Null descriptors have no resource.
+    pub(crate) fn kept_resource(&self, index: u32) -> Option<ID3D12Resource> {
+        self.kept
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(index as usize)
+            .cloned()
+            .flatten()
+    }
+
     /// [`HostHeap::keep`], handing back the resource the slot held.
     fn swap_kept(&self, index: u32, resource: Option<ID3D12Resource>) -> Option<ID3D12Resource> {
         let mut kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
@@ -2607,7 +2618,7 @@ thread_local! {
 
 /// A view description from its words, with the format as the host has it
 /// (a typed buffer view's keeps the title's element size).
-fn srv_desc(words: &[u32; 10]) -> D3D12_SHADER_RESOURCE_VIEW_DESC {
+pub(crate) fn srv_desc(words: &[u32; 10]) -> D3D12_SHADER_RESOURCE_VIEW_DESC {
     let mut words = *words;
     words[0] = crate::resource::pc_view_format(&words, false);
     // SAFETY: 40 bytes in the host's layout.
@@ -2618,7 +2629,7 @@ fn srv_desc(words: &[u32; 10]) -> D3D12_SHADER_RESOURCE_VIEW_DESC {
     }
 }
 
-fn uav_desc(words: &[u32; 10]) -> D3D12_UNORDERED_ACCESS_VIEW_DESC {
+pub(crate) fn uav_desc(words: &[u32; 10]) -> D3D12_UNORDERED_ACCESS_VIEW_DESC {
     let mut words = *words;
     words[0] = crate::resource::pc_view_format(&words, true);
     // SAFETY: 40 bytes in the host's layout.
@@ -4452,7 +4463,11 @@ fn buffer_uav(
 /// where the console reads 0.216 (fxceless's VIctory fork, #578 and #644).
 /// shortcut: a view D3D12 does not cast (FLOAT and UINT, UNORM and SNORM)
 /// still reads in the texture's format; a typeless host copy would take it.
-fn fits(texture: &ID3D12Resource, mut format: Option<&mut DXGI_FORMAT>, unordered: bool) -> bool {
+pub(crate) fn fits(
+    texture: &ID3D12Resource,
+    mut format: Option<&mut DXGI_FORMAT>,
+    unordered: bool,
+) -> bool {
     use crate::resource::format::{ViewUse, note_view_cast, view_cast};
     use crate::resource::{DEPTH_FORMATS, family};
     // SAFETY: a live resource.

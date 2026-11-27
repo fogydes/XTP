@@ -42,6 +42,7 @@ fn counting(axis: usize) -> HostPipeline {
     let shader = Arc::new(Shader {
         stage: "compute",
         hash: format!("group-id-{axis}"),
+        ambient: None,
         container: Vec::new(),
         native: OnceLock::new(),
         translated: OnceLock::from(Some(Translated {

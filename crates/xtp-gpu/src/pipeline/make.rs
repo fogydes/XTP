@@ -917,6 +917,7 @@ mod tests {
         Arc::new(Shader {
             stage,
             hash: format!("{bytes:016x}"),
+            ambient: None,
             container: vec![0; bytes],
             native: OnceLock::new(),
             translated: OnceLock::new(),
@@ -1210,6 +1211,7 @@ mod tests {
         let shader = Arc::new(Shader {
             stage: "compute",
             hash: format!("{:08x}{salt:08x}", native.code.len()),
+            ambient: None,
             container: native.code.clone(),
             native: OnceLock::new(),
             translated: OnceLock::new(),

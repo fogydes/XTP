@@ -18,6 +18,8 @@
 
 #[cfg(windows)]
 mod agility;
+#[cfg(windows)]
+pub mod ambient;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod capture;
 pub mod console;
