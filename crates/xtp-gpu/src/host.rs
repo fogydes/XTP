@@ -51,6 +51,46 @@ pub(crate) fn pc_state(state: u32) -> u32 {
     state & 0x01ff_ffff
 }
 
+/// Milliseconds since the first call.
+pub(crate) fn now_ms() -> u64 {
+    static EPOCH: OnceLock<std::time::Instant> = OnceLock::new();
+    EPOCH
+        .get_or_init(std::time::Instant::now)
+        .elapsed()
+        .as_millis() as u64
+}
+
+/// Available physical RAM on the host in bytes, from `GlobalMemoryStatusEx`.
+pub(crate) fn available_physical_ram() -> Option<u64> {
+    use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+    let mut status = MEMORYSTATUSEX {
+        dwLength: size_of::<MEMORYSTATUSEX>() as u32,
+        ..Default::default()
+    };
+    // SAFETY: a sized structure of ours.
+    let ok = unsafe { GlobalMemoryStatusEx(&mut status) } != 0;
+    ok.then_some(status.ullAvailPhys)
+}
+
+/// Idle timeout in milliseconds before trimming file-backed caches from the
+/// working set, scaled down when free physical RAM is low.
+pub(crate) fn ram_idle_ms(avail_phys: Option<u64>) -> u64 {
+    const GIB: u64 = 1024 * 1024 * 1024;
+    const NORMAL_MS: u64 = 10_000;
+    const MODERATE_MS: u64 = 5_000;
+    const HIGH_MS: u64 = 2_000;
+    let Some(avail) = avail_phys else {
+        return NORMAL_MS;
+    };
+    if avail < 2 * GIB {
+        HIGH_MS
+    } else if avail < 4 * GIB {
+        MODERATE_MS
+    } else {
+        NORMAL_MS
+    }
+}
+
 /// A console state as a host texture state: PC bits only, and none of the
 /// buffer-only ones the console allows on textures (vertex, constant and
 /// index buffer, stream out, indirect arguments, as in "generic read").
@@ -1639,6 +1679,7 @@ impl Host {
     /// As [`Host::run`], waited for and finished before returning with
     /// `sync`.
     fn run_as(&self, runs: &[&HostList], title: bool, sync: bool) {
+        crate::pipeline::trim_library();
         #[cfg(feature = "diagnostics")]
         SPLITS[0].fetch_add(1, Ordering::Relaxed);
         if !sync {
@@ -3880,6 +3921,7 @@ impl Meter {
         if elapsed < std::time::Duration::from_secs(1) {
             return;
         }
+        crate::pipeline::trim_library();
         let drawn = crate::draw::drawn();
         let frames = f64::from(self.frames);
         let fps = frames / elapsed.as_secs_f64();

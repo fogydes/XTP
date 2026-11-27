@@ -871,6 +871,13 @@ pub fn save_pipeline_cache() {
     library::save(true);
 }
 
+/// Lets the mapped pipeline library's pages leave the working set once loads
+/// go idle. Called periodically from host maintenance.
+#[cfg(windows)]
+pub(crate) fn trim_library() {
+    library::trim();
+}
+
 #[cfg(all(test, windows))]
 pub(crate) fn test_graphics_pipeline(
     shaders: Vec<Arc<Shader>>,
