@@ -2042,6 +2042,12 @@ impl Host {
         self.run(runs, false);
     }
 
+    /// Runs closed lists of ours synchronously until GPU completion and
+    /// copy-back finish.
+    pub(crate) fn execute_sync(&self, runs: &[&HostList]) {
+        self.run_as(runs, false, true);
+    }
+
     /// Runs a title submission (the lists of one `ExecuteCommandLists`),
     /// counted for the frame-rate line once it has finished.
     pub(crate) fn submit(&self, runs: &[&HostList]) {

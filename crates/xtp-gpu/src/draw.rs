@@ -1971,20 +1971,97 @@ impl State {
     /// the pass runs for the first pipeline of the frame whatever it reads;
     /// with such a bit it would run only for those that do.
     /// Uploads waiting bindless textures ahead of a one-shot bake draw
-    /// whose pipeline contains a shader registered via [`configure_bake_shaders`].
-    /// Adapted from `fxceless/victory-fork` commit `c96b4f2` (`GPL-3.0-or-later`).
+    /// whose pipeline contains a shader registered via [`configure_bake_shaders`]
+    /// or matches a structural multi-target atlas bake without depth.
+    /// Runs uploads synchronously on a dedicated command list when the host
+    /// device is active so the bake draw never samples un-uploaded inputs
+    /// and staging buffers are released immediately between chunks.
+    /// Adapted from `fxceless/victory-fork` commit `c96b4f2` (`GPL-3.0-or-later`)
+    /// and `codec-d/cool_fox`.
+    fn is_structural_bake(&self) -> bool {
+        self.depth == 0
+            && self.targets.len() >= 4
+            && self
+                .targets
+                .first()
+                .and_then(|&t| crate::resource::texture_kind(t as This))
+                .is_some_and(|(w, h, _)| w >= 512 && w == u64::from(h))
+    }
+
+    fn is_bake_draw(&self, p: &HostPipeline) -> bool {
+        let configured = BAKE_SHADERS.get().copied().unwrap_or(&[]);
+        (!configured.is_empty()
+            && p.stages
+                .iter()
+                .any(|s| configured.contains(&s.shader.hash.as_str())))
+            || self.is_structural_bake()
+    }
+
+    fn run_bake_uploads(&mut self, list: &HostList, remaining_ms: u64) -> u64 {
+        const SHADER_RESOURCE: u32 = 0x40 | 0x80;
+        struct BakeList(HostList);
+        // SAFETY: protected by `BAKE_UPLOAD` mutex across invocations.
+        unsafe impl Send for BakeList {}
+        static BAKE_UPLOAD: std::sync::Mutex<Option<BakeList>> = std::sync::Mutex::new(None);
+        let started = std::time::Instant::now();
+        let mut left = remaining_ms;
+        let mut uploaded = 0u64;
+        if let Some(gpu) = crate::host::host() {
+            let mut guard = BAKE_UPLOAD.lock().unwrap_or_else(|e| e.into_inner());
+            let bake_list = match guard.as_ref() {
+                Some(BakeList(l)) => l,
+                None => {
+                    let Ok(l) = gpu.new_list() else {
+                        return 0;
+                    };
+                    &guard.insert(BakeList(l)).0
+                }
+            };
+            crate::descriptor::begin_sync_heaps(|| gpu.drain()).finish();
+            let flushed = crate::texture::flush_unsubmitted_to_bake(bake_list);
+            for &r in &flushed {
+                crate::list::ensure_state(bake_list, r, SHADER_RESOURCE);
+            }
+            let mut pending_flush = !flushed.is_empty();
+            while left > 0 {
+                let counts = self
+                    .heap_textures_with(bake_list, Some(std::time::Duration::from_millis(left)));
+                if pending_flush || counts.as_ref().is_some_and(|c| c.uploaded > 0) {
+                    bake_list.close();
+                    gpu.execute_sync(&[bake_list]);
+                    bake_list.reset();
+                    crate::texture::release_staging(0, usize::MAX);
+                    pending_flush = false;
+                }
+                let Some(counts) = counts else {
+                    break;
+                };
+                uploaded += counts.uploaded;
+                if counts.uploaded == 0 || counts.left == 0 {
+                    break;
+                }
+                left = remaining_ms.saturating_sub(started.elapsed().as_millis() as u64);
+            }
+        } else {
+            while left > 0 {
+                let Some(counts) =
+                    self.heap_textures_with(list, Some(std::time::Duration::from_millis(left)))
+                else {
+                    break;
+                };
+                uploaded += counts.uploaded;
+                if counts.full != 0 || counts.uploaded == 0 || counts.left == 0 {
+                    break;
+                }
+                left = remaining_ms.saturating_sub(started.elapsed().as_millis() as u64);
+            }
+        }
+        uploaded
+    }
+
     fn bake_textures(&mut self, list: &HostList, p: &HostPipeline, compute: bool) {
         let budget_ms = bake_textures_ms();
-        if compute || budget_ms == 0 {
-            return;
-        }
-        let configured = BAKE_SHADERS.get().copied().unwrap_or(&[]);
-        if configured.is_empty()
-            || !p
-                .stages
-                .iter()
-                .any(|s| configured.contains(&s.shader.hash.as_str()))
-        {
+        if compute || budget_ms == 0 || !self.is_bake_draw(p) {
             return;
         }
         static FRAME: AtomicU64 = AtomicU64::new(u64::MAX);
@@ -1994,33 +2071,21 @@ impl State {
         if FRAME.swap(frame, Ordering::Relaxed) != frame {
             BAKED_MS.store(0, Ordering::Relaxed);
         }
-        let mut left = budget_ms.saturating_sub(BAKED_MS.load(Ordering::Relaxed));
+        let left = budget_ms.saturating_sub(BAKED_MS.load(Ordering::Relaxed));
         if left == 0 {
             return;
         }
         let n = PASSES.fetch_add(1, Ordering::Relaxed) + 1;
         let started = std::time::Instant::now();
-        let mut uploaded = 0u64;
-        while left > 0 {
-            let Some(counts) =
-                self.heap_textures_with(list, Some(std::time::Duration::from_millis(left)))
-            else {
-                break;
-            };
-            uploaded += counts.uploaded;
-            if counts.full != 0 || counts.uploaded == 0 || counts.left == 0 {
-                break;
-            }
-            let spent = started.elapsed().as_millis() as u64;
-            left = budget_ms.saturating_sub(BAKED_MS.load(Ordering::Relaxed).saturating_add(spent));
-        }
-        BAKED_MS.fetch_add(started.elapsed().as_millis() as u64, Ordering::Relaxed);
+        let uploaded = self.run_bake_uploads(list, left);
+        let elapsed_ms = started.elapsed().as_millis() as u64;
+        BAKED_MS.fetch_add(elapsed_ms, Ordering::Relaxed);
         if n.is_power_of_two() && uploaded > 0 {
             tracing::info!(
                 frame,
                 bakes = n,
                 uploaded,
-                ms = started.elapsed().as_millis() as u64,
+                ms = elapsed_ms,
                 "uploaded pending bindless textures ahead of a bake draw (XTP_BAKE_TEXTURES_MS=0 disables)"
             );
         }
@@ -8665,5 +8730,75 @@ float4 ps(V v) : SV_Target { return v.color; }
         assert_eq!(parse_bake_textures_ms(Some(" 0 ")), 0);
         assert_eq!(parse_bake_textures_ms(Some("750")), 750);
         assert_eq!(parse_bake_textures_ms(Some("invalid")), 1500);
+    }
+
+    #[test]
+    fn bake_draw_detects_structural_atlas_bakes_without_depth() {
+        let Some(_gpu) = crate::testgpu::device("structural bake detection") else {
+            return;
+        };
+        let heap = crate::descriptor::TestHeap::views(4);
+        let target_512 = filled_texture(heap.0, 1, 512, 512, 0);
+        let target_rect = filled_texture(heap.0, 2, 512, 256, 0);
+        let target_small = filled_texture(heap.0, 3, 256, 256, 0);
+        let mut s = State::default();
+        s.targets = vec![
+            target_512 as usize,
+            target_512 as usize,
+            target_512 as usize,
+            target_512 as usize,
+        ];
+        assert!(s.is_structural_bake());
+        s.depth = target_512 as usize;
+        assert!(!s.is_structural_bake(), "bakes have no depth buffer");
+        s.depth = 0;
+        s.targets.pop();
+        assert!(!s.is_structural_bake(), "fewer than 4 targets");
+        s.targets = vec![target_rect as usize; 4];
+        assert!(!s.is_structural_bake(), "non-square target");
+        s.targets = vec![target_small as usize; 4];
+        assert!(!s.is_structural_bake(), "smaller than 512x512");
+        drop(s);
+        drop(heap);
+        release(target_512);
+        release(target_rect);
+        release(target_small);
+    }
+
+    #[test]
+    fn bake_uploads_synchronously_and_releases_staging_on_dedicated_list() {
+        use crate::testgpu::TitleList;
+        let test = "draw::tests::bake_uploads_synchronously_and_releases_staging_on_dedicated_list";
+        let Some(gpu) = crate::testgpu::device(test) else {
+            return;
+        };
+        let host = gpu.host();
+        let heap = crate::descriptor::TestHeap::views(4);
+        let queued = filled_texture(heap.0, 1, 8, 8, 0x77);
+        let pre_staged = filled_texture(heap.0, 2, 8, 8, 0x88);
+        let pre_host = crate::resource::host_resource(pre_staged).expect("resident");
+        let unsubmitted = TitleList::new();
+        assert!(crate::texture::upload(
+            unsubmitted.host(),
+            pre_staged,
+            pre_host
+        ));
+        // Even while `unsubmitted` holds `pre_staged`, `queued` goes on the dedicated
+        // bake list synchronously and both textures reach host memory immediately.
+        let list = TitleList::new();
+        let mut s = state(heap.0);
+        heaps(&mut s, list.host());
+        let uploaded = s.run_bake_uploads(list.host(), 1500);
+        assert!(uploaded >= 1, "expected bake upload of queued slot");
+        assert_eq!(texels_4x4(host, queued), vec![0x7777_7777; 16]);
+        assert_eq!(texels_4x4(host, pre_staged), vec![0x8888_8888; 16]);
+        // `queued` was only referenced by the dedicated bake list, so its staging
+        // buffer was released right after synchronous execution.
+        assert_eq!(crate::texture::staged_bytes(queued), None);
+        drop(unsubmitted);
+        drop(list);
+        drop(heap);
+        release(queued);
+        release(pre_staged);
     }
 }
