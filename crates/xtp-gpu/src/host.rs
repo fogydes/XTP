@@ -1041,6 +1041,7 @@ impl Drop for HostList {
     /// and a submission in flight still names it.
     fn drop(&mut self) {
         self.settle();
+        crate::timestamps::forget(self);
     }
 }
 

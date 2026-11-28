@@ -27,9 +27,8 @@
 //! the outer query runs until the outer command ends, and counts both
 //! (counted on the line as nested).
 //!
-//! shortcut: as for timestamps, a list dropped without being reset keeps its
-//! last recording's queries until another list is made at its address, and
-//! a recording that finds no query left is not counted (on the line).
+//! shortcut: a recording that finds no query left is not counted (on the
+//! line).
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -443,6 +442,17 @@ pub(crate) fn open(list: &HostList) {
         .get_or_insert_with(HashMap::new)
         .insert(key(list), Entry::Open(Recording::new(&heap.pool)));
     // Its chunks go back outside the lock (unless a submission holds them).
+    drop(old);
+}
+
+/// A list is being dropped (after its submissions settled): forgets its
+/// recording so its query chunks return to the pool instead of leaking.
+pub(crate) fn forget(list: &HostList) {
+    let old = {
+        let mut lists = LISTS.lock().unwrap_or_else(|e| e.into_inner());
+        lists.as_mut().and_then(|l| l.remove(&key(list)))
+    };
+    // Its chunks go back outside the lock.
     drop(old);
 }
 
@@ -981,5 +991,44 @@ mod tests {
         close(&list);
         list.close();
         assert_eq!(has_entry(), before);
+    }
+
+    /// Dropping a host list without resetting it removes its entry and returns
+    /// its pipeline-statistics query chunks to the pool instead of leaking them.
+    #[test]
+    fn dropping_a_list_returns_its_query_chunks_without_a_reset() {
+        let Some(gpu) =
+            device("pipestats::tests::dropping_a_list_returns_its_query_chunks_without_a_reset")
+        else {
+            return;
+        };
+        let host = gpu.host();
+        FORCED.with(|f| f.set(true));
+        let list = host.new_list().unwrap();
+        let k = key(&list);
+        open(&list);
+        begin(&list, What::Draw, None);
+        end(&list);
+        close(&list);
+        list.close();
+        host.execute(&[&list]);
+        submitted(&[&list]);
+        host.drain();
+        FORCED.with(|f| f.set(false));
+
+        let weak = {
+            let lists = LISTS.lock().unwrap_or_else(|e| e.into_inner());
+            match lists.as_ref().and_then(|l| l.get(&k)) {
+                Some(Entry::Closed(r)) => Arc::downgrade(r),
+                _ => panic!("expected a closed pipestats recording for the submitted list"),
+            }
+        };
+        assert_eq!(weak.strong_count(), 1, "only LISTS holds the recording");
+        drop(list);
+        assert_eq!(
+            weak.strong_count(),
+            0,
+            "dropping the list frees the recording and returns its query chunks"
+        );
     }
 }

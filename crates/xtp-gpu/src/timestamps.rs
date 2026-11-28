@@ -23,11 +23,10 @@
 //!
 //! Timestamps come from one query heap and one read-back buffer, in chunks
 //! of [`CHUNK`] that a recording takes as it goes. They go back once the
-//! list has been reset (or another list made at its address) and every
-//! submission of the old recording has been read: a list reset while its
-//! submission runs records into other chunks. A recording that finds no
-//! chunk left and a list submitted without a closed recording are not timed
-//! (both counted on the line).
+//! list has been reset or dropped and every submission of the old recording
+//! has been read: a list reset while its submission runs records into other
+//! chunks. A recording that finds no chunk left and a list submitted without
+//! a closed recording are not timed (both counted on the line).
 //!
 //! shortcut: a timestamp is taken when the GPU has finished the commands
 //! recorded before it, so commands that overlap on the GPU share out their
@@ -36,10 +35,9 @@
 //! between commands. The timestamps may also cost some of that overlap:
 //! `docs/analysis/gpu-frame.md` compares frames with and without them.
 //!
-//! shortcut: a list dropped without being reset keeps its last recording's
-//! chunks until another list is made at its address. A list submitted again
-//! without a reset is timed again; if both runs finished before the first
-//! was read, both read the second's timestamps.
+//! shortcut: a list submitted again without a reset is timed again; if both
+//! runs finished before the first was read, both read the second's
+//! timestamps.
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -387,6 +385,19 @@ pub(crate) fn open(list: &HostList) {
     drop(old);
     stamp(list, BETWEEN);
     crate::pipestats::open(list);
+}
+
+/// A list is being dropped (after its submissions settled): forgets its
+/// recording so its query chunks return to the pool instead of leaking
+/// until another list reuses the COM pointer address.
+pub(crate) fn forget(list: &HostList) {
+    let old = {
+        let mut lists = LISTS.lock().unwrap_or_else(|e| e.into_inner());
+        lists.as_mut().and_then(|l| l.remove(&key(list)))
+    };
+    // Its chunks go back outside the lock.
+    drop(old);
+    crate::pipestats::forget(list);
 }
 
 /// Just before a list is closed: its last timestamp, and the resolve of
@@ -1300,5 +1311,40 @@ mod tests {
         list.close();
         assert_eq!(entry(), before);
         assert_eq!(read_as(key(&list)).len(), read_before);
+    }
+
+    /// Dropping a host list without resetting it removes its entry and returns
+    /// its timestamp recording's chunks to the pool instead of leaking them.
+    #[test]
+    fn dropping_a_list_returns_its_chunks_without_a_reset() {
+        let Some(gpu) =
+            device("timestamps::tests::dropping_a_list_returns_its_chunks_without_a_reset")
+        else {
+            return;
+        };
+        let host = gpu.host();
+        FORCED.with(|f| f.set(true));
+        let list = host.new_list().unwrap();
+        let k = key(&list);
+        drop(command(&list, What::Draw, None));
+        list.close();
+        host.execute(&[&list]);
+        host.drain();
+        FORCED.with(|f| f.set(false));
+
+        let weak = {
+            let lists = LISTS.lock().unwrap_or_else(|e| e.into_inner());
+            match lists.as_ref().and_then(|l| l.get(&k)) {
+                Some(Entry::Closed(r)) => Arc::downgrade(r),
+                _ => panic!("expected a closed timestamp recording for the submitted list"),
+            }
+        };
+        assert_eq!(weak.strong_count(), 1, "only LISTS holds the recording");
+        drop(list);
+        assert_eq!(
+            weak.strong_count(),
+            0,
+            "dropping the list frees the recording and returns its chunks"
+        );
     }
 }
