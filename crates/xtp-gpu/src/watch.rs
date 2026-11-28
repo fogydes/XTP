@@ -218,10 +218,7 @@ pub(crate) fn poll_merged(ranges: &[(usize, usize)]) -> (u64, Vec<(usize, usize)
         let mut stack: Vec<(usize, usize)> = merged.into_iter().rev().collect();
         while let Some((a, b)) = stack.pop() {
             if KNOWN_VIEWS.contains(a) {
-                let mut k = a + 1;
-                while k < b && KNOWN_VIEWS.contains(k) {
-                    k += 1;
-                }
+                let k = KNOWN_VIEWS.contiguous_set_end(a, b);
                 if k < b {
                     stack.push((k, b));
                 }
@@ -234,14 +231,72 @@ pub(crate) fn poll_merged(ranges: &[(usize, usize)]) -> (u64, Vec<(usize, usize)
             }
             if let Some(count) = j.poll(a..b) {
                 stamps.extend(j.found[..count].iter().map(|&at| at / PAGE));
-            } else if b - a > 1 {
-                let mid = a + (b - a) / 2;
-                stack.push((mid, b));
-                stack.push((a, mid));
-            } else if let Some(dirty) = ask_guard(a, b) {
-                stamps.extend(dirty);
+                continue;
+            }
+            let Some(info) = query_region(a) else {
+                let seg_end = (a + 1).min(b);
+                if seg_end < b {
+                    stack.push((seg_end, b));
+                }
+                unwatched.push((a, seg_end));
+                continue;
+            };
+            use windows_sys::Win32::System::Memory::{MEM_MAPPED, MEM_PRIVATE, MEM_RESERVE};
+            if info.mem_type == MEM_MAPPED {
+                let mut seg_end = info.end_page.min(b);
+                while seg_end < b {
+                    let Some(next) = query_region(seg_end) else {
+                        break;
+                    };
+                    let is_placeholder = next.state == MEM_RESERVE
+                        && next.mem_type == MEM_PRIVATE
+                        && !is_watched_page(seg_end);
+                    if next.mem_type == MEM_MAPPED || is_placeholder {
+                        seg_end = next.end_page.min(b);
+                    } else {
+                        break;
+                    }
+                }
+                if seg_end < b {
+                    stack.push((seg_end, b));
+                }
+                if let Some(dirty) = ask_guard(a, seg_end) {
+                    stamps.extend(dirty);
+                } else {
+                    unwatched.push((a, seg_end));
+                }
+            } else if info.mem_type == MEM_PRIVATE && info.alloc_base != 0 {
+                let mut alloc_end = info.end_page.min(b);
+                while alloc_end < b {
+                    let Some(next) = query_region(alloc_end) else {
+                        break;
+                    };
+                    if next.mem_type == MEM_PRIVATE
+                        && next.alloc_base == info.alloc_base
+                        && next.state == info.state
+                    {
+                        alloc_end = next.end_page.min(b);
+                    } else {
+                        break;
+                    }
+                }
+                if alloc_end < b {
+                    stack.push((alloc_end, b));
+                    if let Some(count) = j.poll(a..alloc_end) {
+                        stamps.extend(j.found[..count].iter().map(|&at| at / PAGE));
+                    } else {
+                        unwatched.push((a, alloc_end));
+                    }
+                } else {
+                    // `j.poll(a..b)` already failed above.
+                    unwatched.push((a, b));
+                }
             } else {
-                unwatched.push((a, b));
+                let seg_end = info.end_page.min(b);
+                if seg_end < b {
+                    stack.push((seg_end, b));
+                }
+                unwatched.push((a, seg_end));
             }
         }
 
@@ -499,6 +554,26 @@ impl FaultPages {
             pages.start += count;
         }
     }
+
+    /// Returns the end of the contiguous run of set bits starting at `page`,
+    /// capped at `limit`.
+    fn contiguous_set_end(&self, mut page: usize, limit: usize) -> usize {
+        while page < limit {
+            let Some(bits) = self.0.get(page >> 16).and_then(OnceLock::get) else {
+                break;
+            };
+            let word = (page >> 6) & 1023;
+            let bit = page & 63;
+            let shifted = bits[word].load(SeqCst) >> bit;
+            let ones = shifted.trailing_ones() as usize;
+            let advance = ones.min(64 - bit).min(limit - page);
+            page += advance;
+            if ones < 64 - bit {
+                break;
+            }
+        }
+        page
+    }
 }
 
 static WRITE_FAULTS: FaultPages = FaultPages::new();
@@ -562,10 +637,11 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
     // its blocks absent (the report before opened them, 5553e29), which the
     // report after forgets too.
     if !KNOWN_VIEWS.contains(first) {
-        if !view(start) {
+        let info = query_region(first)?;
+        if info.mem_type != windows_sys::Win32::System::Memory::MEM_MAPPED {
             return None;
         }
-        KNOWN_VIEWS.set(first..first + 1, true);
+        KNOWN_VIEWS.set(first..info.end_page.min(last).max(first + 1), true);
     }
     let mut written = Vec::new();
     let mut run: Option<usize> = None;
@@ -679,11 +755,13 @@ fn protect(g: &mut Guards, from: usize, to: usize) {
     // guarded yet.
     GUARDED.store(g.protected.len() + g.opening.len() + (to - from), SeqCst);
     let note = |g: &mut Guards, range: Range<usize>| {
+        KNOWN_VIEWS.set(range.clone(), true);
         g.protected.extend(range.clone());
         g.clean.extend(range);
     };
     let unmapped = |g: &mut Guards, block: usize| {
         if placeholder(block * BLOCK) {
+            KNOWN_VIEWS.set(block..block + 1, true);
             g.absent.insert(block);
         } else {
             g.unguardable.insert(block);
@@ -822,6 +900,59 @@ pub(super) fn set_protection(blocks: Range<usize>, protection: u32) -> bool {
     }
 }
 
+/// Virtual memory region metadata returned by [`query_region`].
+struct RegionInfo {
+    alloc_base: usize,
+    end_page: usize,
+    state: u32,
+    mem_type: u32,
+}
+
+/// Queries the virtual memory region containing `page`.
+fn query_region(page: usize) -> Option<RegionInfo> {
+    use windows_sys::Win32::System::Memory::{MEMORY_BASIC_INFORMATION, VirtualQuery};
+    #[cfg(test)]
+    tests::QUERIED.with(|n| n.set(n.get() + 1));
+    #[cfg(feature = "diagnostics")]
+    crate::copystat::add(crate::copystat::C::ViewQueries, 1);
+    // SAFETY: plain data filled in by the query.
+    let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: a valid out pointer of the right size.
+    let n = unsafe { VirtualQuery((page * PAGE) as *const _, &mut info, size_of_val(&info)) };
+    if n == 0 {
+        return None;
+    }
+    let end_page = (info.BaseAddress as usize)
+        .saturating_add(info.RegionSize)
+        .div_ceil(PAGE)
+        .max(page + 1);
+    Some(RegionInfo {
+        alloc_base: info.AllocationBase as usize,
+        end_page,
+        state: info.State,
+        mem_type: info.Type,
+    })
+}
+
+/// Returns whether `page` belongs to a write-watched private allocation.
+fn is_watched_page(page: usize) -> bool {
+    use windows_sys::Win32::System::Memory::GetWriteWatch;
+    let (mut found, mut count, mut granularity) = (0usize, 1, 0);
+    // SAFETY: room for the one address asked for; no reset. It fails
+    // outside write-watched memory.
+    let status = unsafe {
+        GetWriteWatch(
+            0,
+            (page * PAGE) as *const _,
+            PAGE,
+            (&raw mut found).cast(),
+            &mut count,
+            &mut granularity,
+        )
+    };
+    status == 0
+}
+
 /// Whether `at` is in a view (of a section).
 fn view(at: usize) -> bool {
     use windows_sys::Win32::System::Memory::{MEM_MAPPED, MEMORY_BASIC_INFORMATION, VirtualQuery};
@@ -844,34 +975,12 @@ fn view(at: usize) -> bool {
 /// title commits it without a mapping) and a view not committed yet are
 /// not placeholders.
 fn placeholder(at: usize) -> bool {
-    use windows_sys::Win32::System::Memory::{
-        GetWriteWatch, MEM_PRIVATE, MEM_RESERVE, MEMORY_BASIC_INFORMATION, VirtualQuery,
-    };
-    #[cfg(test)]
-    tests::QUERIED.with(|n| n.set(n.get() + 1));
-    #[cfg(feature = "diagnostics")]
-    crate::copystat::add(crate::copystat::C::ViewQueries, 1);
-    // SAFETY: plain data filled in by the query.
-    let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
-    // SAFETY: a valid out pointer of the right size.
-    let n = unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) };
-    if n == 0 || info.State != MEM_RESERVE || info.Type != MEM_PRIVATE {
+    use windows_sys::Win32::System::Memory::{MEM_PRIVATE, MEM_RESERVE};
+    let page = at / PAGE;
+    let Some(info) = query_region(page) else {
         return false;
-    }
-    let (mut found, mut count, mut granularity) = (0usize, 1, 0);
-    // SAFETY: room for the one address asked for; no reset. It fails
-    // outside write-watched memory.
-    let watched = unsafe {
-        GetWriteWatch(
-            0,
-            at as *const _,
-            BLOCK,
-            (&raw mut found).cast(),
-            &mut count,
-            &mut granularity,
-        )
-    } == 0;
-    !watched
+    };
+    info.state == MEM_RESERVE && info.mem_type == MEM_PRIVATE && !is_watched_page(page)
 }
 
 /// Note l'écriture sur les blocs gardés et leurs alias. L'appelant rend
@@ -2309,8 +2418,8 @@ pub(crate) mod tests {
         assert!(!guarding());
     }
 
-    /// A view is asked about once per block an asking starts in, again
-    /// only after the runtime remapped it; other memory every time.
+    /// A view is asked about once across its mapped region, again only
+    /// after the runtime remapped it; other memory every time.
     #[test]
     fn views_are_queried_once_until_remapped() {
         use windows_sys::Win32::System::Memory::{
@@ -2335,20 +2444,20 @@ pub(crate) mod tests {
         assert!(guard(view, view + 2 * BLOCK).is_some());
         assert!(guard(view + 8, view + BLOCK).is_some());
         assert_eq!(queried(), at + 1);
-        // Another start block is asked about once.
+        // The whole view region is already cached: no extra query for the second block.
         assert!(guard(view + BLOCK, view + 2 * BLOCK).is_some());
         assert!(guard(view + BLOCK, view + 2 * BLOCK).is_some());
-        assert_eq!(queried(), at + 2);
+        assert_eq!(queried(), at + 1);
         // The runtime remapped the first block: asked again.
         title_memory_remapped(view, BLOCK);
         assert!(guard(view, view + 2 * BLOCK).is_some());
-        assert_eq!(queried(), at + 3);
+        assert_eq!(queried(), at + 2);
         // Private memory is not a view, however often asked.
         let plain = vec![0u8; 2 * BLOCK];
         let p = plain.as_ptr() as usize;
         assert!(guard(p, p + 16).is_none());
         assert!(guard(p, p + 16).is_none());
-        assert_eq!(queried(), at + 5);
+        assert_eq!(queried(), at + 4);
         unmapped(view, 2);
     }
 
@@ -3781,5 +3890,172 @@ pub(crate) mod tests {
             assert_ne!(VirtualFree(a as *mut _, 0, MEM_RELEASE), 0);
             assert_ne!(VirtualFree(b as *mut _, 0, MEM_RELEASE), 0);
         }
+    }
+
+    #[test]
+    fn poll_merged_steps_across_adjacent_write_watched_allocs_without_binary_splitting() {
+        const PAGES_A: usize = 8;
+        const PAGES_B: usize = 8;
+        let _serial = serial();
+        let placeholder = placeholder_of(PAGES_A + PAGES_B);
+        let addr_a = placeholder;
+        let addr_b = placeholder + PAGES_A * PAGE;
+        // Release the placeholder first so we can attempt contiguous allocations at addr_a and addr_b.
+        released(placeholder, PAGES_A + PAGES_B);
+        let alloc_at = |addr: usize, pages: usize| -> usize {
+            // SAFETY: fresh private write-watched reservation at a test address.
+            let p = unsafe {
+                VirtualAlloc(
+                    addr as *const _,
+                    pages * PAGE,
+                    MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH,
+                    PAGE_READWRITE,
+                )
+            } as usize;
+            if p != 0 {
+                return p;
+            }
+            // SAFETY: fallback private write-watched reservation chosen by Windows.
+            let fallback = unsafe {
+                VirtualAlloc(
+                    std::ptr::null(),
+                    pages * PAGE,
+                    MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH,
+                    PAGE_READWRITE,
+                )
+            };
+            fallback as usize
+        };
+        let a = alloc_at(addr_a, PAGES_A);
+        let b = alloc_at(addr_b, PAGES_B);
+        assert!(a != 0 && b != 0);
+        let base_a = a / PAGE;
+        let base_b = b / PAGE;
+        let ranges: Vec<(usize, usize)> = if a + PAGES_A * PAGE == b {
+            vec![(base_a, base_b + PAGES_B)]
+        } else {
+            vec![(base_a, base_a + PAGES_A), (base_b, base_b + PAGES_B)]
+        };
+        let _ = poll_merged(&ranges);
+        // SAFETY: committed pages inside `a` and `b`.
+        unsafe {
+            *((a + 3 * PAGE) as *mut u8) = 11;
+            *((b + 5 * PAGE) as *mut u8) = 22;
+        }
+        let q_before = queried();
+        let w_before = WATCH_QUERIES.get();
+        let (now, unwatched) = poll_merged(&ranges);
+        let queries = queried() - q_before;
+        let watches = WATCH_QUERIES.get() - w_before;
+        assert!(unwatched.is_empty());
+        assert_eq!(last_write(base_a + 3), now);
+        assert_eq!(last_write(base_b + 5), now);
+        if a + PAGES_A * PAGE == b {
+            // 1 failed poll + <=3 region queries + 2 exact sub-polls (no O(log N) splitting).
+            assert!(queries <= 3, "expected <=3 region queries, got {queries}");
+            assert!(
+                watches <= 3,
+                "expected <=3 write-watch calls, got {watches}"
+            );
+        }
+        // SAFETY: allocations from VirtualAlloc.
+        unsafe {
+            assert_ne!(VirtualFree(a as *mut _, 0, MEM_RELEASE), 0);
+            assert_ne!(VirtualFree(b as *mut _, 0, MEM_RELEASE), 0);
+        }
+    }
+
+    #[test]
+    fn poll_merged_caches_multi_page_view_and_clears_on_remap() {
+        const BLOCKS: usize = 16;
+        let _serial = serial();
+        let view = mapped(BLOCKS);
+        let base = view / PAGE;
+        let (now1, unwatched1) = poll_merged(&[(base, base + BLOCKS)]);
+        assert!(unwatched1.is_empty());
+        for p in base..base + BLOCKS {
+            assert_eq!(last_write(p), now1);
+        }
+
+        let q_before = queried();
+        let w_before = WATCH_QUERIES.get();
+        let (now2, unwatched2) = poll_merged(&[(base, base + BLOCKS)]);
+        assert!(unwatched2.is_empty());
+        assert_eq!(queried() - q_before, 0, "second poll must hit KNOWN_VIEWS");
+        assert_eq!(WATCH_QUERIES.get() - w_before, 0);
+        for p in base..base + BLOCKS {
+            assert!(last_write(p) < now2);
+        }
+
+        poke(view + 9 * PAGE, 77);
+        let q_before = queried();
+        let w_before = WATCH_QUERIES.get();
+        let (now3, unwatched3) = poll_merged(&[(base, base + BLOCKS)]);
+        assert!(unwatched3.is_empty());
+        assert_eq!(queried() - q_before, 0);
+        assert_eq!(WATCH_QUERIES.get() - w_before, 0);
+        assert_eq!(last_write(base + 9), now3);
+        assert!(last_write(base + 8) < now3);
+
+        title_memory_remapped(view, BLOCKS * BLOCK);
+        for p in base..base + BLOCKS {
+            assert!(!KNOWN_VIEWS.contains(p), "remap must clear KNOWN_VIEWS");
+        }
+        unmapped(view, BLOCKS);
+    }
+
+    #[test]
+    fn poll_merged_steps_view_with_placeholder_gap_and_private_watched() {
+        use windows_sys::Win32::System::Memory::{MEM_PRESERVE_PLACEHOLDER, UnmapViewOfFile2};
+        use windows_sys::Win32::System::Threading::GetCurrentProcess;
+        const TOTAL: usize = 6;
+        let _serial = serial();
+        let sec = section(TOTAL);
+        let p = placeholder_of(TOTAL);
+        // Layout: [view 0..2] [placeholder gap 2..4] [view 4..6]
+        let v1 = map_view(sec, p, 0, 2);
+        let v2 = map_view(sec, p + 4 * BLOCK, 4, 2);
+        let base = p / PAGE;
+        // SAFETY: fresh private write-watched test allocation released before returning.
+        let priv_watched = unsafe {
+            VirtualAlloc(
+                std::ptr::null(),
+                3 * PAGE,
+                MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH,
+                PAGE_READWRITE,
+            )
+        } as usize;
+        assert_ne!(priv_watched, 0);
+        let priv_base = priv_watched / PAGE;
+
+        let (now1, unwatched1) = poll_merged(&[(base, base + TOTAL), (priv_base, priv_base + 3)]);
+        assert!(unwatched1.is_empty());
+        for page in base..base + TOTAL {
+            assert_eq!(last_write(page), now1);
+        }
+
+        // Second poll over the view+gap+view span alone: 0 VirtualQuery, 0 GetWriteWatch.
+        let q_before = queried();
+        let w_before = WATCH_QUERIES.get();
+        let (now2, unwatched2) = poll_merged(&[(base, base + TOTAL)]);
+        assert!(unwatched2.is_empty());
+        assert_eq!(queried() - q_before, 0, "view+gap span must stay cached");
+        assert_eq!(WATCH_QUERIES.get() - w_before, 0);
+        for page in base..base + TOTAL {
+            assert!(last_write(page) < now2);
+        }
+
+        // Clean up views and placeholders.
+        title_memory_remapped(p, TOTAL * BLOCK);
+        // SAFETY: test views, section handle, and private allocation owned by this test.
+        unsafe {
+            UnmapViewOfFile2(GetCurrentProcess(), v1, MEM_PRESERVE_PLACEHOLDER);
+            UnmapViewOfFile2(GetCurrentProcess(), v2, MEM_PRESERVE_PLACEHOLDER);
+            windows_sys::Win32::Foundation::CloseHandle(sec);
+            assert_ne!(VirtualFree(priv_watched as *mut _, 0, MEM_RELEASE), 0);
+        }
+        released(p, 2);
+        released(p + 2 * BLOCK, 2);
+        released(p + 4 * BLOCK, 2);
     }
 }
