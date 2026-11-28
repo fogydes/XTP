@@ -8,8 +8,8 @@
 //! stencil reference, topology, targets) is set on the host list as the
 //! title sets it.
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 
 use xtp_shader::{ResourceType, RootType, UsedResource};
 
@@ -30,6 +30,32 @@ macro_rules! once {
         static ONCE: std::sync::Once = std::sync::Once::new();
         ONCE.call_once(|| tracing::warn!($($arg)*));
     }};
+}
+
+/// Shader hashes configured via [`configure_bake_shaders`] whose draws trigger
+/// synchronous bindless texture uploads ahead of their execution.
+static BAKE_SHADERS: OnceLock<&'static [&'static str]> = OnceLock::new();
+
+/// Registers the logged 16-digit shader hashes of one-shot bake draws that
+/// sample bindless heap textures before the world loads.
+pub fn configure_bake_shaders(hashes: &'static [&'static str]) {
+    let _ = BAKE_SHADERS.set(hashes);
+}
+
+fn parse_bake_textures_ms(value: Option<&str>) -> u64 {
+    match value.map(str::trim).map(str::parse::<u64>) {
+        Some(Ok(ms)) => ms,
+        _ => 1500,
+    }
+}
+
+/// Milliseconds per frame spent uploading waiting bindless textures ahead of a
+/// configured bake draw (`XTP_BAKE_TEXTURES_MS`, 1500 by default; 0 disables).
+fn bake_textures_ms() -> u64 {
+    static MS: OnceLock<u64> = OnceLock::new();
+    *MS.get_or_init(|| {
+        parse_bake_textures_ms(std::env::var("XTP_BAKE_TEXTURES_MS").ok().as_deref())
+    })
 }
 
 /// Counts an event and logs it at the first and each power of two after.
@@ -1593,8 +1619,10 @@ impl State {
             self.picking_writes = picked & xtp_shader::emit::RUN_TIME_WRITES != 0;
             self.picked_buffers(list, &p.name);
         }
-        // Textures shaders may pick from the view heap by index: a pass
-        // once a frame ([`State::heap_textures`]).
+        // Textures shaders may pick from the view heap by index: flush pending
+        // uploads first before one-shot bake draws, then the per-frame pass
+        // ([`State::heap_textures`]).
+        self.bake_textures(list, p, compute);
         self.heap_textures(list);
         for stage in &p.stages {
             let t = stage.translated();
@@ -1942,24 +1970,102 @@ impl State {
     /// when they run (`HostShader::run_time_buffers` is about buffers), so
     /// the pass runs for the first pipeline of the frame whatever it reads;
     /// with such a bit it would run only for those that do.
+    /// Uploads waiting bindless textures ahead of a one-shot bake draw
+    /// whose pipeline contains a shader registered via [`configure_bake_shaders`].
+    /// Adapted from `fxceless/victory-fork` commit `c96b4f2` (`GPL-3.0-or-later`).
+    fn bake_textures(&mut self, list: &HostList, p: &HostPipeline, compute: bool) {
+        let budget_ms = bake_textures_ms();
+        if compute || budget_ms == 0 {
+            return;
+        }
+        let configured = BAKE_SHADERS.get().copied().unwrap_or(&[]);
+        if configured.is_empty()
+            || !p
+                .stages
+                .iter()
+                .any(|s| configured.contains(&s.shader.hash.as_str()))
+        {
+            return;
+        }
+        static FRAME: AtomicU64 = AtomicU64::new(u64::MAX);
+        static BAKED_MS: AtomicU64 = AtomicU64::new(0);
+        static PASSES: AtomicU64 = AtomicU64::new(0);
+        let frame = crate::frame::current();
+        if FRAME.swap(frame, Ordering::Relaxed) != frame {
+            BAKED_MS.store(0, Ordering::Relaxed);
+        }
+        let mut left = budget_ms.saturating_sub(BAKED_MS.load(Ordering::Relaxed));
+        if left == 0 {
+            return;
+        }
+        let n = PASSES.fetch_add(1, Ordering::Relaxed) + 1;
+        let started = std::time::Instant::now();
+        let mut uploaded = 0u64;
+        while left > 0 {
+            let Some(counts) =
+                self.heap_textures_with(list, Some(std::time::Duration::from_millis(left)))
+            else {
+                break;
+            };
+            uploaded += counts.uploaded;
+            if counts.full != 0 || counts.uploaded == 0 || counts.left == 0 {
+                break;
+            }
+            let spent = started.elapsed().as_millis() as u64;
+            left = budget_ms.saturating_sub(BAKED_MS.load(Ordering::Relaxed).saturating_add(spent));
+        }
+        BAKED_MS.fetch_add(started.elapsed().as_millis() as u64, Ordering::Relaxed);
+        if n.is_power_of_two() && uploaded > 0 {
+            tracing::info!(
+                frame,
+                bakes = n,
+                uploaded,
+                ms = started.elapsed().as_millis() as u64,
+                "uploaded pending bindless textures ahead of a bake draw (XTP_BAKE_TEXTURES_MS=0 disables)"
+            );
+        }
+    }
+
+    /// The texture side of [`State::picked_buffers`]: textures shaders pick by
+    /// index from the bound view heap (`self.host_heaps[0]`). Each pass
+    /// uploads newly written slots within its budget and checks already-served
+    /// ones for memory changes.
     /// `XTP_HEAP_TEXTURES` sets the bytes a pass stages (0: no pass).
     fn heap_textures(&mut self, list: &HostList) -> Option<crate::descriptor::host::PassCounts> {
+        self.heap_textures_with(list, None)
+    }
+
+    fn heap_textures_with(
+        &mut self,
+        list: &HostList,
+        bake: Option<std::time::Duration>,
+    ) -> Option<crate::descriptor::host::PassCounts> {
         use crate::descriptor::host::{
             PASS_CHECKING, PASS_HASHING, PASS_MAKING, PassCounts, stage_for_pass, video_room,
         };
         use crate::texture::{Change, Staged};
         let heap = self.host_heaps[0];
-        if heap == 0
-            || heap == crate::descriptor::OWN_VIEW_HEAP
-            || self.heap_textured.contains(&heap)
-        {
+        if heap == 0 || heap == crate::descriptor::OWN_VIEW_HEAP {
             return None;
         }
-        self.heap_textured.push(heap);
-        let budget = crate::descriptor::host::heap_textures_budget()?;
+        if bake.is_none() {
+            if self.heap_textured.contains(&heap) {
+                return None;
+            }
+            self.heap_textured.push(heap);
+        }
+        let budget = match bake {
+            Some(_) => 2 << 30,
+            None => crate::descriptor::host::heap_textures_budget()?,
+        };
+        let making = bake.unwrap_or(PASS_MAKING);
         let title = crate::descriptor::heap(heap as This);
         let host = title.host()?;
-        let pass = host.texture_pass()?;
+        let pass = if bake.is_some() {
+            host.texture_pass_for_bake()?
+        } else {
+            host.texture_pass()?
+        };
         let started = std::time::Instant::now();
         let mut counts = PassCounts::default();
         // The slots this pass uploads, first and again (`XTP_PASS_DUMP`).
@@ -1991,7 +2097,7 @@ impl State {
         let mut video_left = video_room(video);
         let mut spent = 0;
         for &(index, write) in &pass.due {
-            if spent >= budget || pass_time_spent(started, PASS_MAKING) {
+            if spent >= budget || pass_time_spent(started, making) {
                 break;
             }
             counts.looked += 1;
@@ -8527,5 +8633,13 @@ float4 ps(V v) : SV_Target { return v.color; }
         release(small_depth);
         release(color);
         release(light);
+    }
+
+    #[test]
+    fn bake_textures_budget_reads_milliseconds_or_zero_to_disable() {
+        assert_eq!(parse_bake_textures_ms(None), 1500);
+        assert_eq!(parse_bake_textures_ms(Some(" 0 ")), 0);
+        assert_eq!(parse_bake_textures_ms(Some("750")), 750);
+        assert_eq!(parse_bake_textures_ms(Some("invalid")), 1500);
     }
 }

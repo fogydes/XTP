@@ -4090,6 +4090,36 @@ impl HostHeap {
         Some(pass)
     }
 
+    /// Pending slots to stage ahead of a one-shot bake draw, even when the
+    /// regular per-frame pass has already run on this frame.
+    pub(crate) fn texture_pass_for_bake(&self) -> Option<TexturePass> {
+        let pass = self.texture_pass_for_bake_at(pass_frame())?;
+        crate::texture::release_staging(RELEASE_IDLE, RELEASE_LOOKS);
+        Some(pass)
+    }
+
+    fn texture_pass_for_bake_at(&self, frame: u64) -> Option<TexturePass> {
+        if self.sampler || self.tabled.is_empty() {
+            return None;
+        }
+        let clock = self.clock(frame);
+        let due = self
+            .textures
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .due(clock, PASS_SLOTS);
+        if due.is_empty() {
+            return None;
+        }
+        Some(TexturePass {
+            frame: clock,
+            due,
+            served: Vec::new(),
+            most: 16,
+            backlog: 0,
+        })
+    }
+
     /// [`HostHeap::texture_pass`] at the title's frame `frame` and `now`.
     fn texture_pass_at(&self, frame: u64, now: std::time::Instant) -> Option<TexturePass> {
         if self.sampler || self.tabled.is_empty() {
@@ -5613,6 +5643,14 @@ mod tests {
         assert!(heap.texture_queue().serve(3));
         let pass = heap.texture_pass_at(later, Instant::now()).expect("a pass");
         assert_eq!(pass.served, [3]);
+
+        // Even after the regular pass ran on `later`, a bake pass still picks
+        // up newly queued slots on the same frame without running served checks.
+        heap.queue_slot(2, Some((20, false)), later);
+        assert!(heap.texture_pass_at(later, Instant::now()).is_none());
+        let bake = heap.texture_pass_for_bake_at(later).expect("a bake pass");
+        assert_eq!(bake.due.iter().map(|d| d.0).collect::<Vec<_>>(), [2]);
+        assert!(bake.served.is_empty());
     }
 
     /// `XTP_HEAP_TEXTURES`: MiB a pass stages, 64 by default; 0, `off` or
