@@ -1110,6 +1110,8 @@ struct Worker {
     /// What goes to pages that are not consecutive pages of one allocation,
     /// before it is copied run by run.
     scatter: Vec<u8>,
+    /// The zlib decoder, reset for each stream.
+    inflater: Inflater,
     /// The current request's time per stage.
     spent: Spent,
 }
@@ -1171,6 +1173,7 @@ fn execute(read: &mut Read, worker: &mut Worker) -> Result<(), HRESULT> {
         source,
         intermediate,
         scatter,
+        inflater,
         spent,
     } = worker;
     let mut to = Destination {
@@ -1203,7 +1206,7 @@ fn execute(read: &mut Read, worker: &mut Worker) -> Result<(), HRESULT> {
     let source = if bc != 0 && options & ZLIB != 0 {
         let started = Instant::now();
         let packed = room(intermediate, request.intermediate_size as usize);
-        let n = inflate(source, packed);
+        let n = inflater.inflate(source, packed);
         to.spent[Stage::Inflate as usize] += started.elapsed();
         &packed[..n.map_err(|hr| fail(hr, "zlib"))?]
     } else {
@@ -1216,20 +1219,56 @@ fn execute(read: &mut Read, worker: &mut Worker) -> Result<(), HRESULT> {
                 .map_err(|e| fail(INVALID_DATA, &e.to_string()))
         }),
         None => to.fill(size, Stage::Inflate, |out| {
-            inflate(source, out).map_err(|hr| fail(hr, "zlib"))
+            inflater.inflate(source, out).map_err(|hr| fail(hr, "zlib"))
         }),
     }
 }
 
-/// Inflates a zlib stream into `out`, returning the bytes written. A stream
-/// that ends short of `out` passes: the title's chunks fill it exactly, and
-/// nothing says that is required.
-fn inflate(source: &[u8], out: &mut [u8]) -> Result<usize, HRESULT> {
-    miniz_oxide::inflate::decompress_slice_iter_to_slice(out, std::iter::once(source), true, false)
-        .map_err(|status| {
-            tracing::debug!(?status, "dstorage: zlib stream");
-            INVALID_DATA
-        })
+/// zlib-rs's decoder. Each worker keeps one: a new one allocates its state.
+struct Inflater(zlib_rs::Inflate);
+
+impl Default for Inflater {
+    fn default() -> Self {
+        // A zlib header, and a window of up to 32 KiB.
+        Self(zlib_rs::Inflate::new(true, 15))
+    }
+}
+
+impl Inflater {
+    /// Inflates a zlib stream into `out`, returning the bytes written. A
+    /// stream that ends short of `out` passes: the title's chunks fill it
+    /// exactly, and nothing says that is required. One that needs more room
+    /// than `out`, is cut short or fails its checksum does not. zlib-rs
+    /// copies in chunks of up to 32 bytes, so up to 31 bytes right after a
+    /// short stream may change; the rest of `out` is left as it was.
+    fn inflate(&mut self, source: &[u8], out: &mut [u8]) -> Result<usize, HRESULT> {
+        use zlib_rs::{InflateFlush, Status};
+        let state = &mut self.0;
+        state.reset(true);
+        // With no room at all zlib-rs cannot tell an empty stream from one
+        // that does not fit, so an empty `out` gets one byte of scratch, and
+        // a stream that writes it fails below.
+        let len = out.len();
+        let mut scratch = [0u8];
+        let out = if len == 0 { &mut scratch[..] } else { out };
+        let status = loop {
+            let at = (state.total_in() as usize, state.total_out() as usize);
+            let status = state.decompress(&source[at.0..], &mut out[at.1..], InflateFlush::NoFlush);
+            let moved = (state.total_in() as usize, state.total_out() as usize) != at;
+            match status {
+                Ok(Status::Ok) if moved => continue,
+                status => break status,
+            }
+        };
+        let written = state.total_out() as usize;
+        match status {
+            Ok(Status::StreamEnd) if written <= len => Ok(written),
+            status => {
+                tracing::debug!(?status, written, "dstorage: zlib stream");
+                Err(INVALID_DATA)
+            }
+        }
+    }
 }
 
 /// The BCPack format's constant tables, parsed once for the process. If
@@ -1413,7 +1452,8 @@ impl Destination<'_> {
     /// module at debug), to follow a destination to the host copies that
     /// read it (`XTP_FULL_REFRESH`), and the destinations' statistics
     /// (`XTP_MESH_STATS=1`). Logged once written, with what was produced:
-    /// a short zlib stream leaves the end of the destination as it was.
+    /// a short zlib stream leaves the end of the destination as it was, but
+    /// for up to 31 bytes right after it (`Inflater::inflate`).
     fn written(&self, form: Form, n: usize) {
         let request = self.request;
         let offset = (request.page_offset & 0xffff) as usize;
@@ -1906,6 +1946,123 @@ mod tests {
         void(queue, 0x30);
         assert_eq!(wait(array, 0), S_OK);
         assert_eq!(out, plain);
+    }
+
+    /// How the decoder before zlib-rs answered, for comparison.
+    fn miniz(source: &[u8], out: &mut [u8]) -> Result<usize, HRESULT> {
+        miniz_oxide::inflate::decompress_slice_iter_to_slice(
+            out,
+            std::iter::once(source),
+            true,
+            false,
+        )
+        .map_err(|_| INVALID_DATA)
+    }
+
+    /// 4 KiB runs of text, of a table of counters and of pseudo-random bytes.
+    fn mixed(n: usize) -> Vec<u8> {
+        let mut x = 0x9e37_79b9_7f4a_7c15_u64;
+        let mut v = Vec::with_capacity(n + 32);
+        while v.len() < n {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            let at = v.len();
+            match at / 4096 % 3 {
+                0 => v.extend_from_slice(format!("sector {} entity ", x % 97).as_bytes()),
+                1 => v.extend_from_slice(&(at as u32).to_le_bytes()),
+                _ => v.extend_from_slice(&x.to_le_bytes()),
+            }
+        }
+        v.truncate(n);
+        v
+    }
+
+    /// Streams of each size and level inflate into room of their size, or
+    /// more, of which no more than 31 bytes past the stream change, and
+    /// padding after them is left alone. One decoder serves them all.
+    #[test]
+    fn inflate_round_trips() {
+        let mut inflater = Inflater::default();
+        for n in [0, 1, 4096, 70_000, 1 << 20] {
+            let plain = mixed(n);
+            for level in [0, 1, 6, 9] {
+                let packed = miniz_oxide::deflate::compress_to_vec_zlib(&plain, level);
+                let mut out = vec![0xa5; n + 100];
+                assert_eq!(
+                    inflater.inflate(&packed, &mut out[..n]),
+                    Ok(n),
+                    "{n} at {level}"
+                );
+                assert_eq!(out[..n], plain);
+                out.fill(0xa5);
+                assert_eq!(
+                    inflater.inflate(&packed, &mut out),
+                    Ok(n),
+                    "{n} at {level}, more"
+                );
+                assert_eq!(out[..n], plain);
+                assert!(
+                    out[n + 32..].iter().all(|&b| b == 0xa5),
+                    "{n} at {level}: past it"
+                );
+                let mut padded = packed.clone();
+                padded.extend_from_slice(&[0xff; 16]);
+                assert_eq!(
+                    inflater.inflate(&padded, &mut out[..n]),
+                    Ok(n),
+                    "{n}, padded"
+                );
+                assert_eq!(miniz(&padded, &mut out[..n]), Ok(n), "{n}, padded, before");
+            }
+        }
+    }
+
+    /// A stream that is cut short, damaged, not zlib or bigger than its room
+    /// fails, as it did before zlib-rs, and the decoder still serves the
+    /// next one.
+    #[test]
+    fn inflate_rejects_what_is_not_a_whole_stream_that_fits() {
+        let mut inflater = Inflater::default();
+        let plain = mixed(70_000);
+        let n = plain.len();
+        let packed = miniz_oxide::deflate::compress_to_vec_zlib(&plain, 6);
+        let mut bad = Vec::new();
+        let end = packed.len();
+        for cut in [0, 1, 2, 100, end / 2, end - 4, end - 1] {
+            bad.push((packed[..cut].to_vec(), n));
+        }
+        let damaged = |at: usize| {
+            let mut v = packed.clone();
+            v[at] ^= 0x55;
+            v
+        };
+        bad.push((damaged(1), n)); // the header's check bits
+        bad.push((damaged(end / 2), n));
+        bad.push((damaged(end - 1), n)); // the checksum
+        bad.push((miniz_oxide::deflate::compress_to_vec(&plain, 6), n)); // no header
+        bad.push((packed.clone(), n - 1));
+        bad.push((packed.clone(), 0));
+        for (i, (source, len)) in bad.iter().enumerate() {
+            let mut out = vec![0u8; *len];
+            assert_eq!(
+                inflater.inflate(source, &mut out),
+                Err(INVALID_DATA),
+                "case {i}"
+            );
+            assert_eq!(
+                miniz(source, &mut out),
+                Err(INVALID_DATA),
+                "case {i}, before"
+            );
+            let mut out = vec![0u8; n];
+            assert_eq!(inflater.inflate(&packed, &mut out), Ok(n), "after case {i}");
+            assert_eq!(out, plain);
+        }
+        // An empty stream needs no room.
+        let empty = miniz_oxide::deflate::compress_to_vec_zlib(&[], 6);
+        assert_eq!(inflater.inflate(&empty, &mut []), Ok(0));
+        assert_eq!(miniz(&empty, &mut []), Ok(0));
     }
 
     #[test]

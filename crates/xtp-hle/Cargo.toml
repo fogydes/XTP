@@ -15,7 +15,7 @@ xtp-loader.workspace = true
 xtp-pe.workspace = true
 xtp-formats.workspace = true
 opus-pure.workspace = true
-miniz_oxide.workspace = true
+zlib-rs.workspace = true
 tracing.workspace = true
 
 [target.'cfg(windows)'.dependencies]
@@ -52,6 +52,8 @@ xtp-gpu = { workspace = true, features = ["readmap-test"] }
 xtp-core.workspace = true
 tempfile.workspace = true
 xtp-testkit.workspace = true
+# Tests compress with another implementation than the one that inflates.
+miniz_oxide.workspace = true
 
 [target.'cfg(windows)'.dev-dependencies]
 windows-sys = { workspace = true, features = ["Win32_System_JobObjects"] }
