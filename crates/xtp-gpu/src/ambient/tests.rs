@@ -472,3 +472,45 @@ fn off_leaves_output_and_constant_works_without_history() {
     assert_eq!(light.word(64, 36, 0), 123456);
     assert!((gray(fixed.word(64, 36, 0)) - 0.3).abs() < 0.002);
 }
+
+#[test]
+fn estimate_skips_all_roles_without_r11_typed_uav_load() {
+    let Some(gpu) = testgpu::device("ambient estimate without r11") else {
+        return;
+    };
+    let estimate = Settings {
+        mode: Mode::Estimate(0.8),
+        air: 1.5,
+    };
+    let passes = Passes::make_with_r11(&gpu.device, estimate, false).unwrap();
+    assert!(passes.keep.is_none());
+    assert!(passes.air.is_none());
+
+    let scene = Scene::new(&gpu.device);
+    let list = gpu.new_list().unwrap();
+    scene.prepare(&list);
+    scene.clear_light(&list, 123456);
+
+    for role in [Role::Radiance, Role::Resolve, Role::Air] {
+        assert!(
+            !passes.record(&list, estimate, &scene.bound(role)),
+            "estimate role {role:?} must be skipped without R11 typed UAV load"
+        );
+    }
+    let untouched = Readback::copy(&gpu, &list, &scene.light);
+
+    // Constant mode does not rely on `keep` and still lifts light.
+    let constant = Settings {
+        mode: Mode::Constant(0.3),
+        air: 0.0,
+    };
+    assert!(passes.record(&list, constant, &scene.bound(Role::Resolve)));
+    let lifted = Readback::copy(&gpu, &list, &scene.light);
+
+    list.close();
+    gpu.execute(&[&list]);
+    gpu.drain();
+
+    assert_eq!(untouched.word(64, 36, 0), 123456);
+    assert!((gray(lifted.word(64, 36, 0)) - 0.3).abs() < 0.002);
+}

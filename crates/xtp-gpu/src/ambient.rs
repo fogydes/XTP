@@ -335,6 +335,14 @@ fn scratch(device: &ID3D12Device, bytes: u64) -> Result<ID3D12Resource> {
 
 impl Passes {
     fn make(device: &ID3D12Device, settings: Settings) -> Result<Self> {
+        Self::make_with_r11(device, settings, typed_load_r11(device))
+    }
+
+    fn make_with_r11(
+        device: &ID3D12Device,
+        settings: Settings,
+        r11_supported: bool,
+    ) -> Result<Self> {
         let raise_code = compile("RAISE", s!("raise"))?;
         // SAFETY: the compiler blob contains the shared root signature.
         let root: ID3D12RootSignature = unsafe {
@@ -362,7 +370,7 @@ impl Passes {
         let raise = pipeline(&raise_code)?;
         let place = make("PLACE", s!("place"))?;
         let gather = make("GATHER", s!("gather"))?;
-        let r11 = matches!(settings.mode, Mode::Estimate(_)) && typed_load_r11(device);
+        let r11 = matches!(settings.mode, Mode::Estimate(_)) && r11_supported;
         if matches!(settings.mode, Mode::Estimate(_)) && !r11 {
             tracing::warn!("ambient estimate needs R11G11B10_FLOAT typed UAV loads");
         }
@@ -402,7 +410,10 @@ impl Passes {
                 )
             }
             Role::Resolve => {
-                let estimate = constant == 0.0;
+                let estimate = matches!(settings.mode, Mode::Estimate(_));
+                if estimate && self.keep.is_none() {
+                    return false;
+                }
                 (
                     [
                         estimate.then_some(&self.place),

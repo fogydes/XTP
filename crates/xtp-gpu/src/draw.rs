@@ -2787,6 +2787,18 @@ impl State {
         used: &[UsedResource],
         made: &[(u8, u32)],
     ) -> Option<crate::ambient::Bound> {
+        match self.resolve_ambient_views(program, used, made) {
+            Ok(bound) => Some(bound),
+            Err(reason) => ambient_refused(program.role, &reason),
+        }
+    }
+
+    fn resolve_ambient_views(
+        &self,
+        program: crate::ambient::Program,
+        used: &[UsedResource],
+        made: &[(u8, u32)],
+    ) -> Result<crate::ambient::Bound, String> {
         use crate::ambient::{Bound, Role, Texture};
         use crate::descriptor::host::{fits, srv_desc, uav_desc};
         use windows::Win32::Graphics::Dxgi::Common::*;
@@ -2801,47 +2813,44 @@ impl State {
                         && u.table_offset_dwords == offset
                 })
             {
-                return ambient_refused(role, &format!("table {slot} entry {offset}: not used so"));
+                return Err(format!("table {slot} entry {offset}: not used so"));
             }
             let Some(&Root::Table(table)) = self.compute.get(usize::from(slot)) else {
-                return ambient_refused(role, &format!("root {slot} is not a table"));
+                return Err(format!("root {slot} is not a table"));
             };
             let address = table + u64::from(offset) * 4;
             let heap = self
                 .heap_of(address)
-                .or_else(|| ambient_refused(role, &format!("table {slot}: no heap")))?;
+                .ok_or_else(|| format!("table {slot}: no heap"))?;
             if self.host_heaps[0] != std::ptr::from_ref(heap) as usize {
-                return ambient_refused(role, &format!("table {slot}: not the bound heap"));
+                return Err(format!("table {slot}: not the bound heap"));
             }
             let host = heap
                 .host()
-                .or_else(|| ambient_refused(role, &format!("table {slot}: no host heap")))?;
+                .ok_or_else(|| format!("table {slot}: no host heap"))?;
             let index = match made.iter().find(|(root, _)| *root == slot) {
                 Some(&(_, base)) => ((base & !(xtp_shader::emit::REMAPPED_SLOT << 5)) / 32)
-                    .checked_add(offset / 8)?,
+                    .checked_add(offset / 8)
+                    .ok_or_else(|| format!("table {slot} entry {offset}: index overflow"))?,
                 None => heap
                     .index(address)
-                    .or_else(|| ambient_refused(role, &format!("table {slot}: no index")))?,
+                    .ok_or_else(|| format!("table {slot}: no index"))?,
             };
-            let view = crate::descriptor::view(address).or_else(|| {
-                ambient_refused(role, &format!("table {slot} entry {offset}: no view"))
-            })?;
+            let view = crate::descriptor::view(address)
+                .ok_or_else(|| format!("table {slot} entry {offset}: no view"))?;
             let view = crate::descriptor::host::placed_texture(&view).unwrap_or(view);
-            let resource = host.kept_resource(index).or_else(|| {
-                ambient_refused(
-                    role,
-                    &format!(
-                        "table {slot} entry {offset}: nothing kept at {index} (made {})",
-                        made.iter().any(|(root, _)| *root == slot)
-                    ),
+            let resource = host.kept_resource(index).ok_or_else(|| {
+                format!(
+                    "table {slot} entry {offset}: nothing kept at {index} (made {})",
+                    made.iter().any(|(root, _)| *root == slot)
                 )
             })?;
             // SAFETY: the descriptor's resource is retained; desc is returned by value.
             let desc = unsafe { resource.GetDesc() };
             if desc.SampleDesc.Count != 1 {
-                return ambient_refused(role, "multisampled");
+                return Err("multisampled".to_owned());
             }
-            Some((
+            Ok((
                 Texture {
                     handle: host.gpu_handle(index),
                     resource,
@@ -2855,8 +2864,9 @@ impl State {
             Role::Radiance => program.layout.radiance,
             Role::Air => program.layout.air,
         };
-        let (image, View::Unordered(_, _, words), desc) = entry(slot, ResourceType::Uav)? else {
-            return ambient_refused(role, "the image is not an unordered view");
+        let (image, view_kind, desc) = entry(slot, ResourceType::Uav)?;
+        let View::Unordered(_, _, words) = view_kind else {
+            return Err("the image is not an unordered view".to_owned());
         };
         let expected = match program.role {
             Role::Resolve => DXGI_FORMAT_R32_UINT,
@@ -2865,15 +2875,12 @@ impl State {
         let mut view = words.as_ref().map(uav_desc);
         let fit = fits(&image.resource, view.as_mut().map(|v| &mut v.Format), true);
         if !fit || view.as_ref().map_or(desc.Format, |v| v.Format) != expected {
-            return ambient_refused(
-                role,
-                &format!(
-                    "image format: resource {} view {:?} fits {fit}, expected {}",
-                    desc.Format.0,
-                    view.as_ref().map(|v| v.Format.0),
-                    expected.0
-                ),
-            );
+            return Err(format!(
+                "image format: resource {} view {:?} fits {fit}, expected {}",
+                desc.Format.0,
+                view.as_ref().map(|v| v.Format.0),
+                expected.0
+            ));
         }
         let volume = program.role == Role::Air;
         let shape_ok = if volume {
@@ -2901,32 +2908,29 @@ impl State {
                 })
         };
         if !shape_ok {
-            return ambient_refused(
-                role,
-                &format!(
-                    "image shape: dimension {} depth {}",
-                    desc.Dimension.0, desc.DepthOrArraySize
-                ),
-            );
+            return Err(format!(
+                "image shape: dimension {} depth {}",
+                desc.Dimension.0, desc.DepthOrArraySize
+            ));
         }
         // The resolve's depth: the layout's entry if it is a single-sample
         // depth view of the light's size, else the first other shader view
         // of the dispatch's tables that is (its tables also hold a stencil
         // view of the same target in some builds).
-        let depth_at = |at: crate::ambient::Binding| -> Option<Texture> {
-            let (depth, View::Shader(resource, words), depth_desc) = entry(at, ResourceType::Srv)?
-            else {
-                return ambient_refused(role, "the depth is not a shader view");
+        let depth_at = |at: crate::ambient::Binding| -> Result<Texture, String> {
+            let (depth, view_kind, depth_desc) = entry(at, ResourceType::Srv)?;
+            let View::Shader(resource, words) = view_kind else {
+                return Err("the depth is not a shader view".to_owned());
             };
             let mut view = words
                 .as_ref()
                 .map(srv_desc)
                 .or_else(|| crate::resource::whole_typed_view(resource as This));
             if !fits(&depth.resource, view.as_mut().map(|v| &mut v.Format), false) {
-                return ambient_refused(
-                    role,
-                    &format!("depth view does not fit resource {}", depth_desc.Format.0),
-                );
+                return Err(format!(
+                    "depth view does not fit resource {}",
+                    depth_desc.Format.0
+                ));
             }
             let format = view.as_ref().map_or(depth_desc.Format, |v| v.Format);
             if !matches!(
@@ -2947,55 +2951,65 @@ impl State {
                         }
                 })
             {
-                return ambient_refused(
-                    role,
-                    &format!(
-                        "depth: format {} dimension {} depth {} size {}x{} vs light {}x{}",
-                        format.0,
-                        depth_desc.Dimension.0,
-                        depth_desc.DepthOrArraySize,
-                        depth_desc.Width,
-                        depth_desc.Height,
-                        desc.Width,
-                        desc.Height
-                    ),
-                );
+                return Err(format!(
+                    "depth: format {} dimension {} depth {} size {}x{} vs light {}x{}",
+                    format.0,
+                    depth_desc.Dimension.0,
+                    depth_desc.DepthOrArraySize,
+                    depth_desc.Width,
+                    depth_desc.Height,
+                    desc.Width,
+                    desc.Height
+                ));
             }
-            Some(depth)
+            Ok(depth)
         };
         let depth = if program.role == Role::Resolve {
             let preferred = program.layout.depth;
-            let others = used
-                .iter()
-                .filter(|u| u.kind == ResourceType::Srv && u.root == RootType::Table)
-                .map(|u| (u.slot, u.table_offset_dwords))
-                .filter(|&at| at != preferred);
-            let Some((at, depth)) = std::iter::once(preferred)
-                .chain(others)
-                .find_map(|at| depth_at(at).map(|depth| (at, depth)))
-            else {
-                return ambient_refused(role, "no depth view among the dispatch's tables");
+            let depth = match depth_at(preferred) {
+                Ok(depth) => depth,
+                Err(preferred_reason) => {
+                    let mut others = used
+                        .iter()
+                        .filter(|u| u.kind == ResourceType::Srv && u.root == RootType::Table)
+                        .map(|u| (u.slot, u.table_offset_dwords))
+                        .filter(|&at| at != preferred);
+                    let Some((at, depth)) =
+                        others.find_map(|at| depth_at(at).ok().map(|depth| (at, depth)))
+                    else {
+                        return Err(format!(
+                            "no depth view among the dispatch's tables (preferred: {preferred_reason})"
+                        ));
+                    };
+                    static SAID: std::sync::Once = std::sync::Once::new();
+                    SAID.call_once(|| {
+                        tracing::debug!(
+                            ?role,
+                            slot = preferred.0,
+                            offset = preferred.1,
+                            reason = %preferred_reason,
+                            "preferred ambient depth view skipped"
+                        );
+                        tracing::info!(
+                            slot = at.0,
+                            offset = at.1,
+                            "ambient depth taken from another table entry"
+                        );
+                    });
+                    depth
+                }
             };
-            if at != preferred {
-                static SAID: std::sync::Once = std::sync::Once::new();
-                SAID.call_once(|| {
-                    tracing::info!(
-                        slot = at.0,
-                        offset = at.1,
-                        "ambient depth taken from another table entry"
-                    )
-                });
-            }
             Some(depth)
         } else {
             None
         };
-        Some(Bound {
+        Ok(Bound {
             role: program.role,
             image,
             depth,
             size: [
-                u32::try_from(desc.Width).ok()?,
+                u32::try_from(desc.Width)
+                    .map_err(|_| format!("image width {} exceeds u32", desc.Width))?,
                 desc.Height,
                 u32::from(desc.DepthOrArraySize),
             ],
@@ -4433,12 +4447,14 @@ pub(crate) fn stencil_ref(list: &HostList, reference: u32) {
 }
 
 #[cfg(windows)]
+static AMBIENT_REFUSED: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+#[cfg(windows)]
 /// Logs why the ambient pass could not take a dispatch's views, once per
 /// distinct reason (up to 32), and gives nothing.
 fn ambient_refused<T>(role: crate::ambient::Role, reason: &str) -> Option<T> {
-    static SEEN: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
     let key = format!("{role:?} {reason}");
-    let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    let mut seen = AMBIENT_REFUSED.lock().unwrap_or_else(|e| e.into_inner());
     if seen.len() < 32 && !seen.contains(&key) {
         tracing::warn!(?role, reason, "ambient views refused");
         seen.push(key);
@@ -8304,5 +8320,187 @@ float4 ps(V v) : SV_Target { return v.color; }
         let third = new_heap();
         state.bind_host_heaps(l, [key, 0], [Some(&third), None]);
         only_other(&state);
+    }
+
+    /// Fallback depth lookup in [`State::ambient_views`] probes non-depth
+    /// shader views silently without recording `AMBIENT_REFUSED` entries, and
+    /// logs only a single refusal when no valid depth view exists at all.
+    #[test]
+    fn ambient_depth_fallback_does_not_spam_refusals() {
+        let test = "draw::tests::ambient_depth_fallback_does_not_spam_refusals";
+        let Some(_gpu) = crate::testgpu::device(test) else {
+            return;
+        };
+        use crate::ambient::{Layout, Program, Role};
+
+        let make_tex = |width, height, format, flags| {
+            #[repr(C)]
+            struct Desc {
+                dimension: u32,
+                alignment: u64,
+                width: u64,
+                height: u32,
+                depth_or_array_size: u16,
+                mip_levels: u16,
+                format: u32,
+                sample_count: u32,
+                sample_quality: u32,
+                layout: u32,
+                flags: u32,
+            }
+            const DEFAULT_HEAP: [u32; 5] = [1, 0, 0, 0, 0];
+            const RESOURCE_IID: crate::object::Iid = crate::object::guid(
+                0x696442be,
+                0xa72e,
+                0x4059,
+                [0xbc, 0x79, 0x5b, 0x5c, 0x98, 0x04, 0x0f, 0xad],
+            );
+            let desc = Desc {
+                dimension: 3,
+                alignment: 0,
+                width,
+                height,
+                depth_or_array_size: 1,
+                mip_levels: 1,
+                format,
+                sample_count: 1,
+                sample_quality: 0,
+                layout: 0,
+                flags,
+            };
+            let null = std::ptr::null();
+            let mut object = null;
+            let made = crate::resource::create_committed(
+                null,
+                DEFAULT_HEAP.as_ptr().cast(),
+                0,
+                (&raw const desc).cast(),
+                0,
+                null.cast(),
+                &RESOURCE_IID,
+                &mut object,
+            );
+            assert_eq!(made, 0, "create title texture");
+            let started = std::time::Instant::now();
+            while crate::resource::host_resource(object).is_none() {
+                assert!(started.elapsed().as_secs() < 5, "never resident");
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            object
+        };
+
+        // Light UAV (64x64 R32_UINT), non-depth preferred SRV (64x64 RGBA8),
+        // wrong-size depth SRV (32x32 R32_FLOAT), and matching depth SRV (64x64 R32_FLOAT).
+        let light = make_tex(64, 64, 42, 4);
+        let color = make_tex(64, 64, 28, 0);
+        let small_depth = make_tex(32, 32, 41, 0);
+        let depth = make_tex(64, 64, 41, 0);
+
+        let heap = TestHeap::views(16);
+        let title = crate::descriptor::heap(heap.0);
+        let host = title.host().expect("a host heap");
+        let slot_addr = |i: u64| title.start + i * 32;
+
+        let uav_r32_uint = [42, 4, 0, 0, 0, 0, 0, 0, 0, 0];
+        let srv_2d = |fmt: u32| [fmt, 4, 0x1688, 0, 0, 1, 0, 0, 0, 0];
+        crate::descriptor::create_uav(
+            std::ptr::null(),
+            light,
+            std::ptr::null(),
+            &uav_r32_uint,
+            slot_addr(0),
+        );
+        crate::descriptor::create_srv(std::ptr::null(), color, &srv_2d(28), slot_addr(1));
+        crate::descriptor::create_srv(std::ptr::null(), small_depth, &srv_2d(41), slot_addr(2));
+        crate::descriptor::create_srv(std::ptr::null(), depth, &srv_2d(41), slot_addr(3));
+
+        let entry = |kind, table_offset_dwords| UsedResource {
+            kind,
+            root: RootType::Table,
+            table_offset_dwords,
+            lower_bound: 0,
+            stride: 0,
+            dwords: 8,
+            user_data: 0,
+            slot: 1,
+        };
+        let used_with_fallback = [
+            entry(ResourceType::Uav, 0),
+            entry(ResourceType::Srv, 8),
+            entry(ResourceType::Srv, 16),
+            entry(ResourceType::Srv, 24),
+        ];
+
+        let list = TitleList::new();
+        let l = list.host();
+        let mut state = state(heap.0);
+        heaps(&mut state, l);
+        state.set_table(true, 1, title.start);
+        let made = state
+            .tables(l, &used_with_fallback, true)
+            .expect("bind ambient table");
+
+        let program = Program {
+            role: Role::Resolve,
+            layout: Layout {
+                light: (1, 0),
+                depth: (1, 8),
+                radiance: (1, 0),
+                air: (1, 0),
+            },
+        };
+
+        let before = AMBIENT_REFUSED
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let bound = state
+            .ambient_views(program, &used_with_fallback, &made)
+            .expect("fallback depth view should be found");
+        assert_eq!(bound.size, [64, 64, 1]);
+        assert_eq!(
+            bound.depth.expect("depth texture").handle.ptr,
+            host.gpu_handle(3).ptr,
+            "fallback should pick slot 3"
+        );
+        let after_ok = AMBIENT_REFUSED
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        assert_eq!(
+            after_ok, before,
+            "probing non-depth candidates must not record refusals when fallback succeeds"
+        );
+
+        // Without any matching depth view, exactly one refusal is recorded.
+        let used_without_depth = &used_with_fallback[..3];
+        assert!(
+            state
+                .ambient_views(program, used_without_depth, &made)
+                .is_none()
+        );
+        let after_missing = AMBIENT_REFUSED
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        assert_eq!(
+            after_missing.len(),
+            before.len() + 1,
+            "missing depth must record a single refusal, not one per candidate"
+        );
+        assert!(
+            after_missing.last().is_some_and(
+                |msg| msg.starts_with("Resolve no depth view among the dispatch's tables")
+            ),
+            "unexpected refusal message: {:?}",
+            after_missing.last()
+        );
+
+        drop(list);
+        drop(heap);
+        release(depth);
+        release(small_depth);
+        release(color);
+        release(light);
     }
 }
