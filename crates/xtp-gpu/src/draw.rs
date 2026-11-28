@@ -2041,7 +2041,8 @@ impl State {
         bake: Option<std::time::Duration>,
     ) -> Option<crate::descriptor::host::PassCounts> {
         use crate::descriptor::host::{
-            PASS_CHECKING, PASS_HASHING, PASS_MAKING, PassCounts, stage_for_pass, video_room,
+            PASS_CHECKING, PASS_HASHING, PassCounts, bake_pass_staging, bake_video_room,
+            pass_making_time, pass_staging, stage_for_pass, video_room,
         };
         use crate::texture::{Change, Staged};
         let heap = self.host_heaps[0];
@@ -2058,7 +2059,12 @@ impl State {
             Some(_) => 2 << 30,
             None => crate::descriptor::host::heap_textures_budget()?,
         };
-        let making = bake.unwrap_or(PASS_MAKING);
+        let making = bake.unwrap_or_else(pass_making_time);
+        let staging_limit = if bake.is_some() {
+            bake_pass_staging()
+        } else {
+            pass_staging()
+        };
         let title = crate::descriptor::heap(heap as This);
         let host = title.host()?;
         let pass = if bake.is_some() {
@@ -2094,7 +2100,11 @@ impl State {
         // every submission. Each texture made counts its bytes; staging
         // buffers count theirs in `spent` (`stage_for_pass`).
         let video = crate::host::host().and_then(|h| crate::dxgi::video_memory(&h.device));
-        let mut video_left = video_room(video);
+        let mut video_left = if bake.is_some() {
+            bake_video_room(video)
+        } else {
+            video_room(video)
+        };
         let mut spent = 0;
         for &(index, write) in &pass.due {
             if spent >= budget || pass_time_spent(started, making) {
@@ -2156,7 +2166,14 @@ impl State {
             }
             // Its staging buffer first: no upload is recorded without one,
             // and a slot is served only once its upload is.
-            match stage_for_pass(resource, texture, budget, &mut spent, &mut counts) {
+            match stage_for_pass(
+                resource,
+                texture,
+                budget,
+                staging_limit,
+                &mut spent,
+                &mut counts,
+            ) {
                 Staged::Ready(_) => {}
                 // Past the room left (this pass's bytes, the staging limit).
                 Staged::NoRoom(_) => {
@@ -2309,7 +2326,14 @@ impl State {
                 // for its next turn, the textures after it go on
                 // (`texture::Refreshes::stage`).
                 Some(staged) => staged,
-                None => stage_for_pass(resource, texture, budget, &mut spent, &mut counts),
+                None => stage_for_pass(
+                    resource,
+                    texture,
+                    budget,
+                    staging_limit,
+                    &mut spent,
+                    &mut counts,
+                ),
             };
             match staged {
                 Staged::Ready(_) => {}

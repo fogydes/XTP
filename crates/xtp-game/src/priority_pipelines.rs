@@ -27,6 +27,16 @@ pub const PRIORITY_SHADERS: &[u64] = &[
     0x477b_52e7_3dde_b6f2,
     0x8b43_7ab6_1d80_08fe,
     0x17af_85f1_70e6_6f30,
+    // One-shot character/decoration bake stages so early bakes are ready on frame one.
+    0xc0a7_fe77_b186_2e10,
+    0x0d15_75a3_96df_e513,
+    0xb7cf_d8dd_a91e_bb6b,
+    0x2809_67ad_158c_ee0b,
+    0xfa45_5c8a_3c32_577b,
+    0xd126_bcae_5d5d_8d26,
+    0xfcee_6129_43c0_08e0,
+    0x089d_6271_be66_50ef,
+    0xd411_1a6e_6ea4_9d91,
 ];
 
 /// Registers the known title's priority shader hashes with `xtp-gpu`.
@@ -45,5 +55,16 @@ mod tests {
         let unique: HashSet<u64> = PRIORITY_SHADERS.iter().copied().collect();
         assert_eq!(unique.len(), PRIORITY_SHADERS.len());
         assert!(!unique.contains(&0));
+    }
+
+    #[test]
+    fn all_bake_shaders_are_prioritized() {
+        for hash in crate::bake_textures::BUILD_1_0_2_1 {
+            let parsed = u64::from_str_radix(hash, 16).expect("valid 16-hex bake hash");
+            assert!(
+                PRIORITY_SHADERS.contains(&parsed),
+                "bake shader {hash} must be registered in PRIORITY_SHADERS"
+            );
+        }
     }
 }

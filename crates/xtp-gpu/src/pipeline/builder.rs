@@ -131,6 +131,11 @@ pub(super) fn admitted() -> bool {
     CALL.get().unwrap_or_else(decided)
 }
 
+/// Whether a BVH builder inventory is registered and currently held (not admitted).
+pub(super) fn held() -> bool {
+    BUILDER.get().is_some() && !admitted()
+}
+
 fn decided() -> bool {
     let group = BUILDER.get().expect("registered builder member");
     let mut last = group.decision.lock().unwrap_or_else(|e| e.into_inner());

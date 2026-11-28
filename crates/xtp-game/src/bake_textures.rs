@@ -1,18 +1,24 @@
-//! Character and decoration bake pixel shader hashes for the known build.
+//! Character and decoration bake shader hashes for the known build.
 //!
-//! Registers the pixel shaders whose draws sample bindless textures by index
-//! while loading, ahead of the first world frame, so waiting heap textures are
-//! staged and uploaded before those one-shot bakes sample them.
+//! Registers the pixel and geometry shaders whose draws sample bindless
+//! textures by index while loading and in world scenes, so waiting heap
+//! textures are staged and uploaded before those one-shot bakes sample them.
 //!
-//! Adapted from `fxceless/victory-fork` commit `c96b4f2` (`GPL-3.0-or-later`).
+//! Adapted from `fxceless/victory-fork` commit `c96b4f2` and
+//! `codec-d/cool_fox` (`GPL-3.0-or-later`).
 
 /// Sixteen-digit logged shader hashes of the known build's one-shot bake
-/// pixel shaders.
-const BUILD_1_0_2_1: &[&str] = &[
+/// pixel and geometry shaders (vertex compositor and projection mesh).
+pub(crate) const BUILD_1_0_2_1: &[&str] = &[
     "c0a7fe77b1862e10",
     "0d1575a396dfe513",
     "b7cfd8dda91ebb6b",
     "280967ad158cee0b",
+    "fa455c8a3c32577b",
+    "d126bcae5d5d8d26",
+    "fcee612943c008e0",
+    "089d6271be6650ef",
+    "d4111a6e6ea49d91",
 ];
 
 fn shaders(executable_hash: &str) -> &'static [&'static str] {
@@ -26,7 +32,7 @@ fn shaders(executable_hash: &str) -> &'static [&'static str] {
     }
 }
 
-/// Registers the known title's bake pixel shader hashes with `xtp-gpu`.
+/// Registers the known title's bake shader hashes with `xtp-gpu`.
 #[cfg(windows)]
 pub fn configure(executable_hash: &str) {
     xtp_gpu::configure_bake_shaders(shaders(executable_hash));

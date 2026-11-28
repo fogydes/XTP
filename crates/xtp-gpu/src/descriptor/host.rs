@@ -3380,6 +3380,23 @@ const PASS_AGAIN: std::time::Duration = std::time::Duration::from_millis(100);
 /// each of the world's first twenty frames" without a limit.)
 pub(crate) const PASS_MAKING: std::time::Duration = std::time::Duration::from_millis(8);
 
+/// Time budget for first-upload passes while due slots are backlogged
+/// (`LOADING` is true, matching [`PASS_LOADING`] on byte budgets).
+pub(crate) const PASS_MAKING_LOADING: std::time::Duration = std::time::Duration::from_millis(64);
+
+fn pass_making(loading: bool) -> std::time::Duration {
+    if loading {
+        PASS_MAKING_LOADING
+    } else {
+        PASS_MAKING
+    }
+}
+
+/// Time budget for the current frame's regular texture upload pass.
+pub(crate) fn pass_making_time() -> std::time::Duration {
+    pass_making(LOADING.load(Ordering::Relaxed))
+}
+
 /// How long a pass checks served textures for changes, in turns from
 /// where the last one stopped.
 pub(crate) const PASS_CHECKING: std::time::Duration = std::time::Duration::from_millis(1);
@@ -3440,6 +3457,17 @@ pub(crate) fn pass_staging() -> u64 {
     })
 }
 
+/// Staging limit for one-shot bake draws: doubles [`pass_staging`] up to
+/// [`PASS_STAGING_MOST`] so character/decoration bakes are not starved when
+/// regular pass staging is saturated.
+pub(crate) fn bake_pass_staging() -> u64 {
+    bake_staging_of(pass_staging())
+}
+
+fn bake_staging_of(limit: u64) -> u64 {
+    limit.saturating_mul(2).min(PASS_STAGING_MOST)
+}
+
 /// [`pass_staging`] for the switch's value: a number of MiB, at most
 /// [`PASS_STAGING_MOST`]; anything else (or none) gives [`PASS_STAGING`].
 fn pass_staging_of(value: Option<&str>) -> u64 {
@@ -3466,6 +3494,11 @@ fn pass_staging_of(value: Option<&str>) -> u64 {
 /// bytes: one 64 MiB texture does not pass because 1 MiB is left.
 pub(crate) const PASS_VIDEO_SHARE: u64 = 85;
 
+/// Higher video memory budget share (percent) used during one-shot bake
+/// uploads so character and decoration compositor draws are not starved by
+/// normal pass eviction headroom.
+pub(crate) const BAKE_VIDEO_SHARE: u64 = 95;
+
 /// The bytes of host textures a pass may make, by the process's local
 /// video memory `(budget, usage)` (`crate::dxgi::video_memory`, asked once
 /// a pass): up to [`PASS_VIDEO_SHARE`] of the budget (`None`, unknown: no
@@ -3476,16 +3509,16 @@ pub(crate) fn video_room(memory: Option<(u64, u64)>) -> u64 {
     })
 }
 
-/// The bytes of staging buffers a pass may make for its next texture, with
-/// `staged` bytes of them there are and `spent` of its `budget` spent by
-/// the pass so far: within the staging limit ([`pass_staging`]) and the
-/// budget; the first of a pass may take more than the budget (it would
-/// never fit otherwise).
-pub(crate) fn staging_room(staged: u64, spent: u64, budget: u64) -> u64 {
-    staging_room_within(pass_staging(), staged, spent, budget)
+/// Like [`video_room`], using [`BAKE_VIDEO_SHARE`] for one-shot bake draws.
+pub(crate) fn bake_video_room(memory: Option<(u64, u64)>) -> u64 {
+    memory.map_or(u64::MAX, |(budget, usage)| {
+        (budget / 100 * BAKE_VIDEO_SHARE).saturating_sub(usage)
+    })
 }
 
-/// [`staging_room`] under the staging limit `limit`.
+/// The bytes of staging buffers a pass may make for its next texture under
+/// staging limit `limit`, with `staged` bytes already live and `spent` of its
+/// `budget` spent by the pass so far; the first of a pass may exceed `budget`.
 fn staging_room_within(limit: u64, staged: u64, spent: u64, budget: u64) -> u64 {
     let pass = if spent == 0 {
         u64::MAX
@@ -3498,22 +3531,27 @@ fn staging_room_within(limit: u64, staged: u64, spent: u64, budget: u64) -> u64 
 /// Makes the staging buffer of `resource` (host copy `texture`) for an
 /// upload by a pass over the textures shaders pick by index (`draw.rs`
 /// `heap_textures`) if it has none, within the room left
-/// ([`staging_room`]: `spent` bytes of the pass's `budget` so far, counted
-/// here): what came of it. Staging memory too full for it counts the pass
-/// as full in `counts` (logged once).
+/// ([`staging_room_within`]: `spent` bytes of the pass's `budget` so far):
+/// what came of it. Staging memory too full for it counts the pass as full in
+/// `counts` (logged once).
 pub(crate) fn stage_for_pass(
     resource: crate::object::This,
     texture: &ID3D12Resource,
     budget: u64,
+    staging_limit: u64,
     spent: &mut u64,
     counts: &mut PassCounts,
 ) -> crate::texture::Staged {
     use crate::texture::Staged;
     let staged = crate::texture::staged_total();
-    let made = crate::texture::stage(resource, texture, staging_room(staged, *spent, budget));
+    let made = crate::texture::stage(
+        resource,
+        texture,
+        staging_room_within(staging_limit, staged, *spent, budget),
+    );
     match made {
         Staged::Ready(bytes) => *spent += bytes,
-        Staged::NoRoom(bytes) if bytes > pass_staging().saturating_sub(staged) => {
+        Staged::NoRoom(bytes) if bytes > staging_limit.saturating_sub(staged) => {
             counts.full = 1;
             once!(
                 mib = staged >> 20,
@@ -4158,15 +4196,18 @@ impl HostHeap {
     }
 
     fn texture_pass_for_bake_at(&self, frame: u64) -> Option<TexturePass> {
+        const BAKE_PASS_SLOTS: usize = 1 << 16;
         if self.sampler || self.tabled.is_empty() {
             return None;
         }
         let clock = self.clock(frame);
+        // Include slots delayed by `TABLED_GRACE` and widen the slice beyond
+        // `PASS_SLOTS` so a one-shot bake sees all waiting bindless slots.
         let due = self
             .textures
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .due(clock, PASS_SLOTS);
+            .due(clock.saturating_add(TABLED_GRACE), BAKE_PASS_SLOTS);
         if due.is_empty() {
             return None;
         }
@@ -5704,12 +5745,19 @@ mod tests {
         assert_eq!(pass.served, [3]);
 
         // Even after the regular pass ran on `later`, a bake pass still picks
-        // up newly queued slots on the same frame without running served checks.
+        // up newly queued slots on the same frame without running served checks,
+        // including slots recently seen in tables (`TABLED_GRACE`).
+        heap.tabled_in(2, later);
         heap.queue_slot(2, Some((20, false)), later);
         assert!(heap.texture_pass_at(later, Instant::now()).is_none());
         let bake = heap.texture_pass_for_bake_at(later).expect("a bake pass");
         assert_eq!(bake.due.iter().map(|d| d.0).collect::<Vec<_>>(), [2]);
         assert!(bake.served.is_empty());
+
+        assert_eq!(pass_making(false), PASS_MAKING);
+        assert_eq!(pass_making(true), PASS_MAKING_LOADING);
+        assert_eq!(bake_staging_of(PASS_STAGING), PASS_STAGING * 2);
+        assert_eq!(bake_staging_of(PASS_STAGING_MOST), PASS_STAGING_MOST);
     }
 
     /// `XTP_HEAP_TEXTURES`: MiB a pass stages, 64 by default; 0, `off` or
@@ -5745,6 +5793,17 @@ mod tests {
         let left = video_room(Some((100 * MIB, 84 * MIB)));
         assert_eq!(left, MIB);
         assert!(64 * MIB > left, "a 64 MiB texture waits");
+        assert_eq!(
+            video_room(Some((100 * MIB, 90 * MIB))),
+            0,
+            "regular pass waits past 85%"
+        );
+        assert_eq!(
+            bake_video_room(Some((100 * MIB, 90 * MIB))),
+            5 * MIB,
+            "bake pass admits up to 95%"
+        );
+        assert_eq!(bake_video_room(None), u64::MAX);
         let room = |staged, spent, budget| staging_room_within(PASS_STAGING, staged, spent, budget);
         assert_eq!(room(0, 0, 64 * MIB), PASS_STAGING, "the first");
         assert_eq!(room(0, 60 * MIB, 64 * MIB), 4 * MIB);
