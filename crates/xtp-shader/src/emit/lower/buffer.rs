@@ -1693,13 +1693,29 @@ impl<'a> Lower<'a> {
                     dword(self, at)?
                 }
                 Some((width, signed)) => {
-                    // shortcut: the field is taken not to cross a dword.
                     let (not3, three) = (self.s.m.i32(!3), self.s.m.i32(3));
                     let at = self.s.m.bin(c, Bin::And, off, not3);
                     let w = dword(self, at)?;
                     let byte = self.s.m.bin(c, Bin::And, off, three);
                     let sh = self.s.m.bin(c, Bin::Shl, byte, three);
-                    let x = self.s.m.bin(c, Bin::LShr, w, sh);
+                    let mut x = self.s.m.bin(c, Bin::LShr, w, sh);
+                    if width == 16 {
+                        let crosses = self.s.m.cmp(c, pred::EQ, byte, three);
+                        let four = self.s.m.i32(4);
+                        let mut valid = self.s.m.bool(true);
+                        let next = self.raw_add(at, four, &mut valid);
+                        let next = self.s.m.select(c, valid, next, at);
+                        // An aligned half at the end of a view must not read
+                        // beyond it just to discard the extra byte later.
+                        let next = self.s.m.select(c, crosses, next, at);
+                        let hi = dword(self, next)?;
+                        let zero = self.s.m.i32(0);
+                        let hi = self.s.m.select(c, valid, hi, zero);
+                        let eight = self.s.m.i32(8);
+                        let hi = self.s.m.bin(c, Bin::Shl, hi, eight);
+                        let both = self.s.m.bin(c, Bin::Or, x, hi);
+                        x = self.s.m.select(c, crosses, both, x);
+                    }
                     let left = self.s.m.i32(32 - width);
                     let x = self.s.m.bin(c, Bin::Shl, x, left);
                     self.s
