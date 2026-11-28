@@ -30,6 +30,7 @@
 //! longer than the budget is lost; `XTP_PIPELINE_WAIT_MS` raises it.
 
 use std::collections::VecDeque;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -128,9 +129,7 @@ impl Pending {
     /// which runs `counted` before signalling it finished: whoever sees
     /// `finished` sees what `counted` counted.
     pub(super) fn make(&self, counted: impl FnOnce()) -> bool {
-        let mut first = false;
-        self.made.get_or_init(|| {
-            first = true;
+        self.make_with(counted, || {
             #[cfg(feature = "diagnostics")]
             let _ = super::host::take_refusal();
             let started = Instant::now();
@@ -153,6 +152,38 @@ impl Pending {
                 let _ = self.refusal.set(why);
             }
             made
+        })
+    }
+
+    fn make_with(
+        &self,
+        counted: impl FnOnce(),
+        build: impl FnOnce() -> Option<HostPipeline>,
+    ) -> bool {
+        let mut first = false;
+        self.made.get_or_init(|| {
+            first = true;
+            // A panic during translation or pipeline creation must complete
+            // this entry and wake waiters instead of killing the worker thread
+            // and leaving `made` empty forever.
+            match catch_unwind(AssertUnwindSafe(build)) {
+                Ok(pipeline) => pipeline,
+                Err(payload) => {
+                    let panic = payload
+                        .downcast_ref::<&str>()
+                        .copied()
+                        .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+                        .unwrap_or("unknown panic");
+                    tracing::warn!(
+                        shaders = ?self.shaders,
+                        panic,
+                        "host pipeline build panicked"
+                    );
+                    #[cfg(feature = "diagnostics")]
+                    let _ = self.refusal.set(format!("build panicked: {panic}"));
+                    None
+                }
+            }
         });
         if first {
             counted();
@@ -942,6 +973,58 @@ mod tests {
         assert!(p.queued.load(Ordering::Relaxed) >= URGENT);
         until_finished(&p);
         assert!(matches!(p.made.get(), Some(None)));
+    }
+
+    /// A panic inside a pipeline build marks that entry refused, wakes waiters,
+    /// runs its completion accounting, and leaves the worker thread alive to
+    /// process subsequent requests.
+    #[test]
+    fn a_panicking_pipeline_is_refused_and_the_worker_continues() {
+        let bad = Arc::new(Pending::new(Vec::new(), None, None));
+        let good = Arc::new(Pending::new(Vec::new(), None, None));
+        let bad_counted = Arc::new(AtomicU64::new(0));
+        let good_counted = Arc::new(AtomicU64::new(0));
+
+        let failed = bad.clone();
+        let next = good.clone();
+        let bad_c = bad_counted.clone();
+        let good_c = good_counted.clone();
+        let worker = std::thread::spawn(move || {
+            assert!(failed.make_with(
+                || {
+                    bad_c.fetch_add(1, Ordering::Relaxed);
+                },
+                || panic!("synthetic pipeline build panic"),
+            ));
+            assert!(next.make_with(
+                || {
+                    good_c.fetch_add(1, Ordering::Relaxed);
+                },
+                || None,
+            ));
+        });
+
+        worker.join().expect("the pipeline worker should survive");
+        assert!(bad.finished.load(Ordering::Acquire));
+        assert!(good.finished.load(Ordering::Acquire));
+        assert!(matches!(bad.made.get(), Some(None)));
+        assert!(matches!(good.made.get(), Some(None)));
+        assert_eq!(bad_counted.load(Ordering::Relaxed), 1);
+        assert_eq!(good_counted.load(Ordering::Relaxed), 1);
+        #[cfg(feature = "diagnostics")]
+        assert!(missing(&bad).is_some_and(|(why, _)| {
+            why.contains("build panicked: synthetic pipeline build panic")
+        }));
+
+        // Once refused, later attempts stay complete without rebuilding or recounting.
+        assert!(!bad.make_with(
+            || {
+                bad_counted.fetch_add(1, Ordering::Relaxed);
+            },
+            || panic!("the refused pipeline should stay complete"),
+        ));
+        assert_eq!(bad_counted.load(Ordering::Relaxed), 1);
+        assert!(matches!(bad.made.get(), Some(None)));
     }
 
     /// A pipeline that is not made in time costs a frame its budget once:
