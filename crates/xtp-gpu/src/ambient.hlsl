@@ -1,10 +1,12 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-// Adapted from the ambient passes of a VIctory fork.
+// Adapted from the ambient passes of a VIctory fork; the cut reset follows
+// edsuuu/VI-BR-PORT@370700b6 and the floor follows crbns/victory-tapin@a08708c3.
 
-#define RS "RootConstants(num32BitConstants=12, b0), DescriptorTable(SRV(t0, flags=DESCRIPTORS_VOLATILE)), DescriptorTable(UAV(u0, flags=DESCRIPTORS_VOLATILE)), UAV(u1), UAV(u2)"
+#define RS "RootConstants(num32BitConstants=14, b0), DescriptorTable(SRV(t0, flags=DESCRIPTORS_VOLATILE)), DescriptorTable(UAV(u0, flags=DESCRIPTORS_VOLATILE)), UAV(u1), UAV(u2)"
 #define CX 64
 #define CY 36
 #define CELLS (CX * CY)
+#define GEO (2 * CELLS + 1)
 #define PX 160
 #define PY 90
 #define POINTS (PX * PY * 3)
@@ -12,10 +14,11 @@ cbuffer Set : register(b0) {
     float level; float constant; float strength; float radius;
     float near; float tan_y; uint width; uint height;
     float follow; float most; float air; float lamps;
+    float cut; float floor_share;
 };
 Texture2D<float> depth : register(t0);
-// Cells: the light they send out (then, at CELLS, the slow mean), from
-// CELLS + 1 on where they are.
+// Cell radiance and mean log luminance, then the slow RGB mean at CELLS,
+// then the cell positions. GEO holds slow luminance in linear and log space.
 RWStructuredBuffer<float4> cells : register(u1);
 // Three per point: red, green and blue, each a mean and a direction.
 // The last element says whether a gather has run.
@@ -43,23 +46,34 @@ void keep(uint3 at : SV_DispatchThreadID) {
         bound = clamp(lamps * dot(slow.rgb, LUMA), 1e-4, 20.0);
     }
     float3 sum = 0;
+    float log_sum = 0;
     for (uint y = 0; y < 5; y++) for (uint x = 0; x < 5; x++) {
         uint2 p = uint2((float2(at.xy) + (float2(x, y) + 0.5) / 5.0) * float2(w, h) / float2(CX, CY));
         float3 c = max(radiance[p], 0.0);
         c = any(isnan(c)) || any(isinf(c)) ? 0.0 : c;
         // Lamps and glints count, but not for everything.
-        sum += c / max(1.0, dot(c, LUMA) / bound);
+        c /= max(1.0, dot(c, LUMA) / bound);
+        sum += c;
+        if (cut > 0.0 || floor_share > 0.0) log_sum += log(dot(c, LUMA) + 1e-3);
     }
-    cells[at.y * CX + at.x] = float4(sum / 25.0, 1.0);
+    cells[at.y * CX + at.x] = float4(sum, log_sum) / 25.0;
 }
 [RootSignature(RS)]
 [numthreads(1, 1, 1)]
 void mean() {
-    float3 sum = 0;
-    for (uint i = 0; i < CELLS; i++) sum += cells[i].rgb;
+    float4 sum = 0;
+    for (uint i = 0; i < CELLS; i++) sum += cells[i];
     float4 was = cells[CELLS];
-    float3 now = sum / CELLS;
-    cells[CELLS] = float4(was.a > 0.0 ? lerp(was.rgb, now, follow) : now, 1.0);
+    float4 now = sum / CELLS;
+    float f = was.a > 0.0 ? follow : 1.0;
+    if (cut > 0.0 || floor_share > 0.0) {
+        float geo_now = now.a;
+        float4 geo_was = cells[GEO];
+        if (cut > 0.0 && abs(geo_now - geo_was.y) > cut) f = 1.0;
+        float geo_log = f == 1.0 ? geo_now : lerp(geo_was.y, geo_now, f);
+        cells[GEO] = float4(max(exp(geo_log) - 1e-3, 0.0), geo_log, 0.0, 0.0);
+    }
+    cells[CELLS] = float4(f == 1.0 ? now.rgb : lerp(was.rgb, now.rgb, f), 1.0);
 }
 #endif
 
@@ -205,6 +219,7 @@ void raise(uint3 at : SV_DispatchThreadID) {
     found = all + 1.2 * float3(dot(sr.xyz, n), dot(sg.xyz, n), dot(sb.xyz, n)) / sum;
     found = clamp(found, 0.2 * all, 2.5 * all);
     found = lerp(found, cells[CELLS].rgb, 0.2) * level * open;
+    if (floor_share > 0.0) found = max(found, floor_share * cells[GEO].x * level * open);
     float3 was = unpack(light[p]);
     // What the program left counts as far as it can be true: the sky's light
     // outdoors, not the blocks of other memory.
