@@ -50,7 +50,7 @@ Per-texture residency gives about 0.9 MB/s past the threshold; heaps of
 | more than a quarter heap (64 MiB) | committed | one heap each anyway |
 | over the budget, or a placement the driver refuses | committed, logged | see 2.4 |
 
-**The pool is off by default** (§3.3): `XTP_TEXTURE_POOL=1` turns it on; unset or `0`, every host texture is committed, as before.
+**The pool and its reserved textures are on by default on a host with less than 32 GiB of RAM (§3.5), off elsewhere (§3.3)**: `XTP_TEXTURE_POOL=1` and `XTP_TEXTURE_TILES=1` turn them on, `0` off; with the pool off, every host texture is committed, as before.
 
 ### 2.2 The pool (`resource/pool.rs`)
 
@@ -274,6 +274,55 @@ other processes, so it varied even after the resources were released.
 This answers part of [#74](https://github.com/MiamiGame/XTP/issues/74).
 Measurements on more drivers are wanted, especially AMD, Intel, older
 NVIDIA drivers, and adapters with shared memory.
+
+### 3.5 In game (Series S, 16 GiB of RAM): on by default below 32 GiB
+
+The measure §3.3 asks for, on a host where the RAM is what runs out:
+- RTX 5070, 12 GB, driver 32.0.16.1664; Ryzen 5 5600; 16 GiB of RAM;
+  Windows 11 build 26200.
+- Series S mode, the autopilot from the golden save to the world
+  (`XTP_SKIP_INTRO=1`, `XTP_WATCHDOG_HOOK=1`), one session at a time.
+- The same binary for every session; only `XTP_TEXTURE_POOL` and
+  `XTP_TEXTURE_TILES` differ.
+- A guard stops the title once the system's commit headroom falls below
+  2 GB. On this host, commit runs out long before video memory does.
+
+The world load runs from the first frame line with more than 500 host
+textures alive to the autopilot's world condition ("line 17: met"). The
+card and private figures are from the last frame line before control comes
+back to the player.
+
+| session | switches | world load | card (DXGI local) at the world | process private at the world | residency requests | handed out before their heap was resident | in the world before the guard |
+|---|---|---|---|---|---|---|---|
+| B1 | `XTP_TEXTURE_POOL=0`, `XTP_TEXTURE_TILES=0` | 85 s | 9,269 of 10,875 MiB | 18,716 MiB | 24,927 | — | 3 s |
+| B2 | `XTP_TEXTURE_POOL=0`, `XTP_TEXTURE_TILES=0` | 70 s | 9,526 of 10,835 MiB | 19,073 MiB | 24,995 | — | 14 s |
+| P | pool, `XTP_TEXTURE_TILES=0` | 203 s | 9,746 of 11,031 MiB | 18,370 MiB | 1,212 | 1 | 22 s |
+| PT | pool and tiles (unset: this default) | 144 s | 5,266 of 11,176 MiB | 14,079 MiB | 1,216 | 0 | 192 s |
+
+Seven earlier pool-and-tiles sessions loaded the world in 106 to 199 s.
+They ran on binaries that differ only outside textures.
+
+What they show:
+- **Without the pool and its reserved textures, a 16 GiB host does not
+  stay in the world.** Commit runs out 3 and 14 s after the title gets
+  control (B1, B2).
+- **The reserved textures are what saves the memory.** The pool alone (P)
+  holds as much card and private memory as committed textures. With tiles
+  (PT), 4.0 to 4.5 GB less video memory is in use and 4.3 to 5.0 GB less is
+  private at the world than in B1, B2 and P. The world then runs for 192 s
+  before the guard. The guard then
+  stops it for other growth: the buffer copies of title memory and the
+  snapshot mirrors (fogydes/XTP#45).
+- **Loading is slower with the pool on this host:** 144 s against 70 and
+  85 s, and 106 to 199 s over eight pool-and-tiles sessions. Residency
+  requests drop from about 25,000 to 1,200.
+- The card stays well below its budget (5.3 of 11.2 GB at the world, 7.2 GB
+  at the peak), so the reserve does not push it past the ceiling. No
+  texture was handed out before its heap was resident with tiles.
+
+So `low_memory_host` (`resource/pool.rs`) turns both on when they are unset
+on a host with less than 32 GiB of RAM. Elsewhere they stay off, as §3.3
+decided.
 
 ## 4. Review items of dark-world's delivery (Samuel's relay)
 
