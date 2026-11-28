@@ -81,6 +81,8 @@ struct Settings {
     mode: Mode,
     air: f32,
     lamps: f32,
+    cut: f32,
+    floor: f32,
 }
 
 impl Settings {
@@ -89,17 +91,14 @@ impl Settings {
     /// XTP_AMBIENT_AIR sets a positive cap multiplier in estimate mode.
     /// XTP_AMBIENT_LAMPS sets a positive per-sample cap multiple of the slow
     /// frame mean in estimate mode (bounded by 20).
-    fn read() -> Self {
+    fn read(get: impl Fn(&str) -> Option<String>) -> Self {
+        let number = |name| get(name).as_deref().and_then(positive).unwrap_or_default();
         Self {
-            mode: Mode::parse(&std::env::var("XTP_AMBIENT").unwrap_or_default()),
-            air: std::env::var("XTP_AMBIENT_AIR")
-                .ok()
-                .and_then(|text| positive(&text))
-                .unwrap_or_default(),
-            lamps: std::env::var("XTP_AMBIENT_LAMPS")
-                .ok()
-                .and_then(|text| positive(&text))
-                .unwrap_or_default(),
+            mode: Mode::parse(&get("XTP_AMBIENT").unwrap_or_default()),
+            air: number("XTP_AMBIENT_AIR"),
+            lamps: number("XTP_AMBIENT_LAMPS"),
+            cut: number("XTP_AMBIENT_CUT").max(1.0).ln(),
+            floor: number("XTP_AMBIENT_FLOOR"),
         }
     }
 
@@ -177,7 +176,7 @@ fn override_roles(roles: &mut HashMap<u64, Role>, text: &str, mut invalid: impl 
 /// 16 hex digits printed by the runtime. The last assignment wins.
 pub fn configure(layout: Layout, defaults: &[(&str, Role)]) {
     CONFIGURATION.get_or_init(|| {
-        let settings = Settings::read();
+        let settings = Settings::read(|name| std::env::var(name).ok());
         let mut roles = HashMap::new();
         if settings.mode != Mode::Off {
             roles.extend(
@@ -236,7 +235,7 @@ pub(crate) struct Bound {
 }
 
 const SOURCE: &str = include_str!("ambient.hlsl");
-const CELL_BYTES: u64 = (2 * 64 * 36 + 1) * 16;
+const CELL_BYTES: u64 = (2 * 64 * 36 + 2) * 16;
 const POINT_BYTES: u64 = (160 * 90 * 3 + 1) * 16;
 
 struct Passes {
@@ -461,6 +460,8 @@ impl Passes {
             4.0f32.to_bits(),
             settings.air.to_bits(),
             settings.lamps.to_bits(),
+            settings.cut.to_bits(),
+            settings.floor.to_bits(),
         ];
         list.keep(&bound.image.resource);
         if let Some(depth) = &bound.depth {

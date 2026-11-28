@@ -1,6 +1,37 @@
 use super::*;
 use crate::host::{Host, transition};
 use crate::testgpu;
+use windows::Win32::Foundation::RECT;
+
+fn settings_with(values: &[(&str, &str)]) -> Settings {
+    Settings::read(|name| {
+        values
+            .iter()
+            .find(|(key, _)| *key == name)
+            .map(|(_, value)| (*value).to_owned())
+    })
+}
+
+#[test]
+fn cut_and_floor_settings() {
+    for text in [
+        None,
+        Some("0"),
+        Some("-2"),
+        Some("NaN"),
+        Some("inf"),
+        Some("bad"),
+    ] {
+        let settings = Settings::read(|_| text.map(str::to_owned));
+        assert_eq!((settings.cut, settings.floor), (0.0, 0.0));
+    }
+    for ratio in ["0.5", "1.0"] {
+        assert_eq!(settings_with(&[("XTP_AMBIENT_CUT", ratio)]).cut, 0.0);
+    }
+    let settings = settings_with(&[("XTP_AMBIENT_CUT", " 4 "), ("XTP_AMBIENT_FLOOR", "0.75")]);
+    assert_eq!((settings.cut, settings.floor), (4.0_f32.ln(), 0.75));
+    assert!(!settings.runs(Role::Resolve));
+}
 
 #[test]
 fn settings_and_role_table() {
@@ -234,39 +265,44 @@ impl Scene {
         }
     }
 
-    fn clear_radiance(&self, list: &HostList, split: bool) {
-        use windows::Win32::Foundation::RECT;
-        let clear = |value, rects: &[RECT]| {
-            // SAFETY: the list has the heap set, and the radiance is a live UAV.
-            unsafe {
-                list.list.ClearUnorderedAccessViewFloat(
-                    self.gpu_at(RADIANCE),
-                    self.cpu_at(&self.cpu, RADIANCE),
-                    &self.radiance,
-                    &[value; 4],
-                    rects,
-                );
-            }
-        };
-        if split {
-            let left = RECT {
+    fn clear_radiance(&self, list: &HostList, value: f32, rects: &[RECT]) {
+        // SAFETY: the heap is bound and radiance is a live UAV; order any preceding writes.
+        unsafe {
+            list.list.ResourceBarrier(&[uav_barrier()]);
+            list.list.ClearUnorderedAccessViewFloat(
+                self.gpu_at(RADIANCE),
+                self.cpu_at(&self.cpu, RADIANCE),
+                &self.radiance,
+                &[value; 4],
+                rects,
+            );
+        }
+    }
+
+    fn split_radiance(&self, list: &HostList) {
+        self.clear_radiance(list, 2.0, &[]);
+        self.clear_radiance(
+            list,
+            0.0,
+            &[RECT {
                 left: 0,
                 top: 0,
                 right: (WIDTH / 2) as i32,
                 bottom: HEIGHT as i32,
-            };
-            let right = RECT {
-                left: left.right,
-                right: WIDTH as i32,
-                ..left
-            };
-            clear(0.0, &[left]);
-            // SAFETY: an open list; order the two clears of one UAV.
-            unsafe { list.list.ResourceBarrier(&[uav_barrier()]) };
-            clear(2.0, &[right]);
-        } else {
-            clear(2.0, &[]);
-        }
+            }],
+        );
+    }
+
+    fn resolve_light(
+        &self,
+        gpu: &Host,
+        list: &HostList,
+        passes: &Passes,
+        settings: Settings,
+    ) -> Readback {
+        self.clear_light(list, 0);
+        assert!(passes.record(list, settings, &self.bound(Role::Resolve)));
+        Readback::copy(gpu, list, &self.light)
     }
 }
 
@@ -381,7 +417,7 @@ fn estimate_passes_use_radiance_and_bound_light() {
     let settings = Settings {
         mode: Mode::Estimate(0.8),
         air: 1.5,
-        lamps: 0.0,
+        ..settings_with(&[])
     };
     let passes = Passes::make(&gpu.device, settings).unwrap();
     let scene = Scene::new(&gpu.device);
@@ -396,7 +432,7 @@ fn estimate_passes_use_radiance_and_bound_light() {
     assert!(passes.record(&list, settings, &resolve));
     let first = Readback::copy(&gpu, &list, &scene.light);
 
-    scene.clear_radiance(&list, false);
+    scene.clear_radiance(&list, 2.0, &[]);
     assert!(passes.record(&list, settings, &keep));
     assert!(passes.record(&list, settings, &resolve));
     let bounded = Readback::copy(&gpu, &list, &scene.light);
@@ -419,7 +455,7 @@ fn estimate_passes_use_radiance_and_bound_light() {
     assert!(passes.record(&list, settings, &scene.bound(Role::Air)));
     let air = Readback::copy(&gpu, &list, &scene.air);
 
-    scene.clear_radiance(&list, true);
+    scene.split_radiance(&list);
     assert!(passes.record(&list, settings, &keep));
     scene.clear_light(&list, 0);
     assert!(passes.record(&list, settings, &resolve));
@@ -459,7 +495,7 @@ fn off_leaves_output_and_constant_works_without_history() {
     let settings = Settings {
         mode: Mode::Off,
         air: 1.5,
-        lamps: 0.0,
+        ..settings_with(&[])
     };
     for role in [Role::Radiance, Role::Resolve, Role::Air] {
         assert!(!settings.record(&list, &scene.bound(role), || panic!(
@@ -470,7 +506,7 @@ fn off_leaves_output_and_constant_works_without_history() {
     let constant = Settings {
         mode: Mode::Constant(0.3),
         air: 1.5,
-        lamps: 0.0,
+        ..settings_with(&[])
     };
     assert!(!constant.runs(Role::Radiance));
     assert!(!constant.runs(Role::Air));
@@ -492,7 +528,7 @@ fn estimate_skips_all_roles_without_r11_typed_uav_load() {
     let estimate = Settings {
         mode: Mode::Estimate(0.8),
         air: 1.5,
-        lamps: 0.0,
+        ..settings_with(&[])
     };
     let passes = Passes::make_with_r11(&gpu.device, estimate, false).unwrap();
     assert!(passes.keep.is_none());
@@ -514,8 +550,7 @@ fn estimate_skips_all_roles_without_r11_typed_uav_load() {
     // Constant mode does not rely on `keep` and still lifts light.
     let constant = Settings {
         mode: Mode::Constant(0.3),
-        air: 0.0,
-        lamps: 0.0,
+        ..settings_with(&[])
     };
     assert!(passes.record(&list, constant, &scene.bound(Role::Resolve)));
     let lifted = Readback::copy(&gpu, &list, &scene.light);
@@ -535,8 +570,8 @@ fn lamp_cap_limits_bright_radiance_relative_to_slow_mean() {
     };
     let settings = Settings {
         mode: Mode::Estimate(0.8),
-        air: 0.0,
         lamps: 4.0,
+        ..settings_with(&[])
     };
     let passes = Passes::make(&gpu.device, settings).unwrap();
     let scene = Scene::new(&gpu.device);
@@ -547,28 +582,9 @@ fn lamp_cap_limits_bright_radiance_relative_to_slow_mean() {
 
     // Seed the slow frame mean at 0.5, then sample uniform 10.0 radiance.
     // Uncapped it would resolve near 8.0; with a 4x lamp cap (2.0) it stays well under 3.0.
-    // SAFETY: the heap is bound and the radiance texture is a live UAV.
-    unsafe {
-        list.list.ClearUnorderedAccessViewFloat(
-            scene.gpu_at(RADIANCE),
-            scene.cpu_at(&scene.cpu, RADIANCE),
-            &scene.radiance,
-            &[0.5; 4],
-            &[],
-        );
-    }
+    scene.clear_radiance(&list, 0.5, &[]);
     assert!(passes.record(&list, settings, &keep));
-    // SAFETY: the heap is bound and the radiance texture is a live UAV.
-    unsafe {
-        list.list.ResourceBarrier(&[uav_barrier()]);
-        list.list.ClearUnorderedAccessViewFloat(
-            scene.gpu_at(RADIANCE),
-            scene.cpu_at(&scene.cpu, RADIANCE),
-            &scene.radiance,
-            &[10.0; 4],
-            &[],
-        );
-    }
+    scene.clear_radiance(&list, 10.0, &[]);
     assert!(passes.record(&list, settings, &keep));
     scene.clear_light(&list, 0);
     assert!(passes.record(&list, settings, &resolve));
@@ -582,4 +598,73 @@ fn lamp_cap_limits_bright_radiance_relative_to_slow_mean() {
         level < 3.0,
         "lamp cap did not bound bright radiance: {level}"
     );
+}
+
+#[test]
+fn cut_resets_log_luminance_history_in_both_directions() {
+    let Some(gpu) = testgpu::device("ambient cut") else {
+        return;
+    };
+    let settings = settings_with(&[("XTP_AMBIENT", "1"), ("XTP_AMBIENT_CUT", "2")]);
+    let passes = Passes::make(&gpu.device, settings).unwrap();
+    let scene = Scene::new(&gpu.device);
+    let list = gpu.new_list().unwrap();
+    scene.prepare(&list);
+    let keep = scene.bound(Role::Radiance);
+    scene.split_radiance(&list);
+    assert!(passes.record(&list, settings, &keep));
+    let frames = [1.5, 2.0, 0.125].map(|value| {
+        scene.clear_radiance(&list, value, &[]);
+        assert!(passes.record(&list, settings, &keep));
+        scene.resolve_light(&gpu, &list, &passes, settings)
+    });
+    list.close();
+    gpu.execute(&[&list]);
+    gpu.drain();
+
+    // The split frame averages 1 arithmetically but under 0.05 geometrically.
+    // Only the middle step follows slowly: 80% current + 20% slow RGB mean.
+    for (frame, expected) in frames.iter().zip([1.5, 1.904, 0.125]) {
+        let actual = gray(frame.word(64, 36, 0));
+        assert!(
+            (actual - expected).abs() < 0.005,
+            "expected {expected}, got {actual}"
+        );
+    }
+}
+
+#[test]
+fn floor_lifts_black_samples_relative_to_slow_luminance() {
+    let Some(gpu) = testgpu::device("ambient floor") else {
+        return;
+    };
+    let settings = settings_with(&[("XTP_AMBIENT", "0.5"), ("XTP_AMBIENT_FLOOR", "0.75")]);
+    let passes = Passes::make(&gpu.device, settings).unwrap();
+    let scene = Scene::new(&gpu.device);
+    let list = gpu.new_list().unwrap();
+    scene.prepare(&list);
+    let keep = scene.bound(Role::Radiance);
+    scene.clear_radiance(&list, 2.0, &[]);
+    assert!(passes.record(&list, settings, &keep));
+    let bright = scene.resolve_light(&gpu, &list, &passes, settings);
+    scene.clear_radiance(&list, 0.0, &[]);
+    assert!(passes.record(&list, settings, &keep));
+    let baseline = scene.resolve_light(
+        &gpu,
+        &list,
+        &passes,
+        Settings {
+            floor: 0.0,
+            ..settings
+        },
+    );
+    let lifted = scene.resolve_light(&gpu, &list, &passes, settings);
+    list.close();
+    gpu.execute(&[&list]);
+    gpu.drain();
+
+    let slow = (0.96 * 2.001_f32.ln() + 0.04 * 0.001_f32.ln()).exp() - 0.001;
+    assert!((gray(bright.word(64, 36, 0)) - 1.0).abs() < 0.005);
+    assert!((gray(baseline.word(64, 36, 0)) - 0.192).abs() < 0.005);
+    assert!((gray(lifted.word(64, 36, 0)) - 0.75 * slow * 0.5).abs() < 0.005);
 }
