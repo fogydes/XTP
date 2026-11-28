@@ -358,6 +358,22 @@ unsafe impl Send for Inner {}
 // SAFETY: as above.
 unsafe impl Sync for Inner {}
 
+/// How long to hold off new `CreateHeap` calls after a driver refusal
+/// (`E_OUTOFMEMORY` or similar), while still serving placements from free
+/// ranges of already-created heaps.
+const HEAP_FAIL_BACKOFF: Duration = Duration::from_millis(500);
+
+fn backoff_active(until: Option<Instant>, now: Instant) -> bool {
+    until.is_some_and(|u| now < u)
+}
+
+fn backoff_wait(until: Option<Instant>, now: Instant, idle: Duration) -> Duration {
+    until
+        .and_then(|u| u.checked_duration_since(now))
+        .filter(|d| !d.is_zero())
+        .map_or(idle, |d| d.min(idle))
+}
+
 struct State {
     classes: [Vec<Heap>; 2],
     /// Heaps to release (on the thread).
@@ -373,6 +389,10 @@ struct State {
     /// Whether heaps are held back by the budget now (logged once each
     /// time it starts).
     over_budget: bool,
+    /// Hold off new `CreateHeap` calls until this instant after a refusal.
+    backoff_until: Option<Instant>,
+    /// Driver `CreateHeap` refusals since the pool was made (rate-limits logs).
+    refusals: u64,
     stats: Stats,
 }
 
@@ -936,6 +956,8 @@ impl Pool {
                 woken: true,
                 next_id: 1,
                 over_budget: false,
+                backoff_until: None,
+                refusals: 0,
                 stats: Stats::default(),
             }),
             wake: Condvar::new(),
@@ -1226,7 +1248,7 @@ impl Inner {
         h.textures += 1;
         let taken = (h.heap.clone(), h.id, offset, h.residency.clone(), h.made);
         s.stats.placed += 1;
-        if self.short(&s, class) {
+        if self.short(&s, class) && !backoff_active(s.backoff_until, Instant::now()) {
             s.woken = true;
             self.wake.notify_all();
         }
@@ -1386,7 +1408,8 @@ impl Inner {
                 .map(|(i, _)| i)
                 .and_then(|i| scattered(&mut heaps[i].ranges, len).map(|r| (i, r))),
         };
-        let wake = taken.is_none() || self.short(&s, class);
+        let wake = (taken.is_none() || self.short(&s, class))
+            && !backoff_active(s.backoff_until, Instant::now());
         let found = taken.map(|(i, ranges)| {
             let h = &mut s.classes[class.index()][i];
             h.textures += ranges.len() as u32;
@@ -1401,10 +1424,14 @@ impl Inner {
 
     /// Makes a heap of `size` bytes for `class`, not resident, and asks for
     /// it to become resident (not waited for). False, logged, past the
-    /// budget or if the driver refuses.
+    /// budget or if the driver refuses (backing off for [`HEAP_FAIL_BACKOFF`]
+    /// on driver refusal while existing heaps keep serving placements).
     fn add_heap(&self, class: Class, size: u64, emergency: bool) -> bool {
         let pending: u64 = {
             let s = self.lock();
+            if backoff_active(s.backoff_until, Instant::now()) {
+                return false;
+            }
             s.classes
                 .iter()
                 .flatten()
@@ -1430,13 +1457,31 @@ impl Inner {
             return false;
         }
         let started = Instant::now();
-        let Some(heap) = self.make_heap(size) else {
-            return false;
+        let heap = match self.make_heap(size) {
+            Ok(heap) => heap,
+            Err(e) => {
+                let mut s = self.lock();
+                s.refusals += 1;
+                s.backoff_until = Some(Instant::now() + HEAP_FAIL_BACKOFF);
+                let n = s.refusals;
+                drop(s);
+                if n <= 4 || n.is_power_of_two() {
+                    tracing::warn!(
+                        n,
+                        error = %e,
+                        mib = size / MIB,
+                        backoff_ms = HEAP_FAIL_BACKOFF.as_millis() as u64,
+                        "no texture heap: the driver refused it; backing off heap creation"
+                    );
+                }
+                return false;
+            }
         };
         let pageable: Option<ID3D12Pageable> = heap.cast().ok();
         let residency = Arc::new(Residency::ask(&self.device, vec![pageable]));
         let ms = started.elapsed().as_secs_f64() * 1000.0;
         let mut s = self.lock();
+        s.backoff_until = None;
         if std::mem::replace(&mut s.over_budget, false) {
             tracing::info!("texture heaps within the video memory budget again");
         }
@@ -1473,7 +1518,7 @@ impl Inner {
 
     /// A default heap of `size` bytes for textures that are no targets,
     /// not resident and (if the runtime can) not zeroed.
-    fn make_heap(&self, size: u64) -> Option<ID3D12Heap> {
+    fn make_heap(&self, size: u64) -> windows::core::Result<ID3D12Heap> {
         let flags = |zeroed: bool| {
             let base =
                 D3D12_HEAP_FLAG_ALLOW_ONLY_NON_RT_DS_TEXTURES | D3D12_HEAP_FLAG_CREATE_NOT_RESIDENT;
@@ -1507,12 +1552,9 @@ impl Inner {
             made => made,
         };
         match made {
-            Ok(Some(heap)) => Some(heap),
-            Ok(None) => None,
-            Err(e) => {
-                tracing::warn!(error = %e, mib = size / MIB, "no texture heap: the driver refused it");
-                None
-            }
+            Ok(Some(heap)) => Ok(heap),
+            Ok(None) => Err(windows::core::Error::empty()),
+            Err(e) => Err(e),
         }
     }
 
@@ -1565,9 +1607,10 @@ impl Inner {
             if s.stop {
                 return;
             }
+            let wait = backoff_wait(s.backoff_until, Instant::now(), Duration::from_secs(1));
             let _ = self
                 .wake
-                .wait_timeout_while(s, Duration::from_secs(1), |s| !s.stop && !s.woken);
+                .wait_timeout_while(s, wait, |s| !s.stop && !s.woken);
         }
     }
 
@@ -2497,5 +2540,80 @@ pub(crate) mod tests {
         assert_eq!(class, Class::Normal);
         assert_eq!(offset % KIB_64, 0);
         assert_eq!(len % KIB_64, 0);
+    }
+
+    #[test]
+    fn heap_failure_backoff_window_and_wait_duration() {
+        let now = Instant::now();
+        let idle = Duration::from_secs(1);
+        assert!(!backoff_active(None, now));
+        assert_eq!(backoff_wait(None, now, idle), idle);
+
+        let until = now + HEAP_FAIL_BACKOFF;
+        assert!(backoff_active(Some(until), now));
+        assert_eq!(backoff_wait(Some(until), now, idle), HEAP_FAIL_BACKOFF);
+        assert_eq!(
+            backoff_wait(Some(now + Duration::from_secs(5)), now, idle),
+            idle,
+            "wait is capped to the normal idle poll interval"
+        );
+        // At or past the deadline, backoff is inactive and normal idle wait resumes.
+        assert!(!backoff_active(Some(until), until));
+        assert_eq!(backoff_wait(Some(until), until, idle), idle);
+    }
+
+    #[test]
+    fn existing_heap_free_ranges_serve_placements_during_heap_backoff() {
+        let test =
+            "resource::pool::tests::existing_heap_free_ranges_serve_placements_during_heap_backoff";
+        let Some(gpu) = crate::testgpu::device(test) else {
+            return;
+        };
+        let pool = Pool::with_small(
+            gpu.device.clone(),
+            Config::sized(MIB, MIB),
+            unlimited(),
+            false,
+        );
+        assert!(pool.settle(Duration::from_secs(5)));
+        assert!(pool.resident(Duration::from_secs(5)));
+        assert_eq!(pool.stats().heaps, 1);
+
+        // Enter the post-refusal backoff window: existing heap free ranges must
+        // keep serving placements while new CreateHeap attempts are suppressed.
+        pool.inner.lock().backoff_until = Some(Instant::now() + Duration::from_secs(10));
+        let desc = texture(256, 256, DXGI_FORMAT_R8G8B8A8_UNORM, 1);
+        let state = D3D12_RESOURCE_STATE_COPY_DEST;
+        let mut kept: Vec<Placed> = (0..4)
+            .map(|_| {
+                pool.place(&desc, state)
+                    .expect("fits in existing 1 MiB heap")
+            })
+            .collect();
+        assert_eq!(pool.stats().heaps, 1, "no new heap made during backoff");
+
+        // Existing heap is now full; new heap creation is suppressed by backoff.
+        assert_eq!(
+            pool.place(&desc, state).err(),
+            Some("no heap (budget or driver)")
+        );
+        assert_eq!(pool.stats().heaps, 1, "still no new heap during backoff");
+
+        // Freeing one slot lets another placement succeed from the existing heap.
+        kept.pop();
+        let reused = pool
+            .place(&desc, state)
+            .expect("freed range serves placement during backoff");
+        kept.push(reused);
+        assert_eq!(pool.stats().heaps, 1);
+
+        // Once the backoff window expires, new heap growth resumes.
+        pool.inner.lock().backoff_until = Some(Instant::now() - Duration::from_millis(1));
+        let overflow = pool
+            .place(&desc, state)
+            .expect("heap growth resumes after backoff expires");
+        assert!(pool.stats().heaps >= 2);
+        drop(overflow);
+        drop(kept);
     }
 }
