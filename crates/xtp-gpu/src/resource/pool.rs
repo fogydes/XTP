@@ -1085,6 +1085,13 @@ impl Pool {
         self.inner.lock().stats
     }
 
+    /// Whether heap creation backs off after a driver refusal
+    /// ([`HEAP_FAIL_BACKOFF`]): critical memory pressure for the passes'
+    /// staging buffers too (`host::commit`).
+    pub(crate) fn backing_off(&self) -> bool {
+        backoff_active(self.inner.lock().backoff_until, Instant::now())
+    }
+
     /// What it holds now.
     pub(crate) fn holding(&self) -> Holding {
         self.inner.holding()

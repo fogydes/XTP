@@ -3441,7 +3441,9 @@ fn staging_room_within(limit: u64, staged: u64, spent: u64, budget: u64) -> u64 
 /// `heap_textures`) if it has none, within the room left
 /// ([`staging_room`]: `spent` bytes of the pass's `budget` so far, counted
 /// here): what came of it. Staging memory too full for it counts the pass
-/// as full in `counts` (logged once).
+/// as full in `counts` (logged once). With the host's commit too low for
+/// new staging buffers (`host::commit::admits_staging`), only a texture
+/// that has one goes on; the others are [`Staged::NotNow`](crate::texture::Staged::NotNow).
 pub(crate) fn stage_for_pass(
     resource: crate::object::This,
     texture: &ID3D12Resource,
@@ -3451,8 +3453,18 @@ pub(crate) fn stage_for_pass(
 ) -> crate::texture::Staged {
     use crate::texture::Staged;
     let staged = crate::texture::staged_total();
-    let made = crate::texture::stage(resource, texture, staging_room(staged, *spent, budget));
+    let admitted = crate::host::commit::admits_staging();
+    let room = if admitted {
+        staging_room(staged, *spent, budget)
+    } else {
+        0
+    };
+    let made = crate::texture::stage(resource, texture, room);
     match made {
+        Staged::NoRoom(_) if !admitted => {
+            once!("textures shaders pick by index: host commit low, new staging buffers wait");
+            return Staged::NotNow;
+        }
         Staged::Ready(bytes) => *spent += bytes,
         Staged::NoRoom(bytes) if bytes > pass_staging().saturating_sub(staged) => {
             counts.full = 1;
@@ -3468,10 +3480,13 @@ pub(crate) fn stage_for_pass(
 
 /// The bytes a frame's pass stages for first uploads of textures shaders
 /// pick by index: the base budget ([`heap_textures_base`]), or
-/// [`PASS_LOADING`] times it while the passes leave due slots (a backlog).
+/// [`PASS_LOADING`] times it while the passes leave due slots (a backlog),
+/// lowered under host memory pressure (`host::commit`, from cool_fox).
 /// `None`: no pass.
 pub(crate) fn heap_textures_budget() -> Option<u64> {
-    heap_textures_base().map(|base| pass_budget(base, LOADING.load(Ordering::Relaxed)))
+    let pressure = crate::host::commit::pressure();
+    heap_textures_base()
+        .map(|base| pressure.pass_budget(pass_budget(base, LOADING.load(Ordering::Relaxed))))
 }
 
 /// The base budget of a frame's pass (`XTP_HEAP_TEXTURES`, MiB, 64 by
@@ -4083,10 +4098,12 @@ impl HostHeap {
     /// `heap_textures`); `None` for the others, and in sampler heaps. A
     /// pass first releases the staging buffers no list holds any more
     /// (`texture::release_staging`): the staging limit is on those that
-    /// live.
+    /// live. Under host memory pressure it looks at more textures for them
+    /// (`host::commit`).
     pub(crate) fn texture_pass(&self) -> Option<TexturePass> {
         let pass = self.texture_pass_at(pass_frame(), std::time::Instant::now())?;
-        crate::texture::release_staging(RELEASE_IDLE, RELEASE_LOOKS);
+        let looks = crate::host::commit::pressure().release_looks(RELEASE_LOOKS);
+        crate::texture::release_staging(RELEASE_IDLE, looks);
         Some(pass)
     }
 

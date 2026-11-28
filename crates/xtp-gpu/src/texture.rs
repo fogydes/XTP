@@ -1128,19 +1128,27 @@ impl Refreshes {
     /// [`Staged::NoRoom`]: the next pass's share takes it first. Past what
     /// a pass of its own could make with the staging buffers that live,
     /// [`Staged::NotNow`]: looked at again at its next turn, and the pass
-    /// goes on with the textures after it ([`refused`]).
+    /// goes on with the textures after it ([`refused`]); so too with the
+    /// host's commit too low for new staging buffers (`host::commit`).
     pub(crate) fn stage(&mut self, resource: This) -> Option<Staged> {
         if gpu_written(resource as usize) {
             return Some(Staged::Host);
         }
         let staging = state_of(resource)?;
         let (limit, staged) = (crate::descriptor::host::pass_staging(), staged_total());
-        let room = refresh_room(self.share, self.made, limit, staged);
+        // None made with the host's commit low (`host::commit`).
+        let admitted = crate::host::commit::admits_staging();
+        let room = if admitted {
+            refresh_room(self.share, self.made, limit, staged)
+        } else {
+            0
+        };
         Some(match staging.make_upload(room) {
             Ok(made) => {
                 self.made += made;
                 Staged::Ready(made)
             }
+            Err(Staged::NoRoom(_)) if !admitted => Staged::NotNow,
             Err(Staged::NoRoom(bytes)) => refused(bytes, self.share, self.made, limit, staged),
             Err(why) => why,
         })

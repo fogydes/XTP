@@ -24,6 +24,7 @@
 
 mod awake;
 pub(crate) mod buffers;
+pub(crate) mod commit;
 mod frames;
 pub(crate) mod preparation;
 #[cfg(test)]
@@ -67,6 +68,12 @@ pub(crate) fn now_ms() -> u64 {
 
 /// Available physical RAM on the host in bytes, from `GlobalMemoryStatusEx`.
 pub(crate) fn available_physical_ram() -> Option<u64> {
+    available_memory().map(|(physical, _)| physical)
+}
+
+/// Available physical RAM and commit (what RAM and the page file can still
+/// back for this process) on the host in bytes, from `GlobalMemoryStatusEx`.
+pub(crate) fn available_memory() -> Option<(u64, u64)> {
     use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
     let mut status = MEMORYSTATUSEX {
         dwLength: size_of::<MEMORYSTATUSEX>() as u32,
@@ -74,7 +81,7 @@ pub(crate) fn available_physical_ram() -> Option<u64> {
     };
     // SAFETY: a sized structure of ours.
     let ok = unsafe { GlobalMemoryStatusEx(&mut status) } != 0;
-    ok.then_some(status.ullAvailPhys)
+    ok.then_some((status.ullAvailPhys, status.ullAvailPageFile))
 }
 
 /// Idle timeout in milliseconds before trimming file-backed caches from the
