@@ -573,6 +573,21 @@ fn warp_adapter() -> windows::core::Result<IDXGIAdapter> {
 mod tests {
     use super::*;
 
+    /// `XTP_SCRATCH_CHUNK_KIB` wins, in 64 KiB units up to 4 MiB; unset,
+    /// zero or not a number, a host with less than 32 GiB of RAM takes
+    /// 256 KiB chunks, another 4 MiB.
+    #[test]
+    fn scratch_chunks_follow_the_setting_then_the_host_memory() {
+        assert_eq!(chunk_for(None, false), SCRATCH_CHUNK);
+        assert_eq!(chunk_for(None, true), SCRATCH_CHUNK_LOW);
+        assert_eq!(chunk_for(Some("many"), true), SCRATCH_CHUNK_LOW);
+        assert_eq!(chunk_for(Some(" 0 "), false), SCRATCH_CHUNK);
+        assert_eq!(chunk_for(Some("100"), false), 128 << 10);
+        assert_eq!(chunk_for(Some("4096"), true), SCRATCH_CHUNK);
+        assert_eq!(chunk_for(Some("65536"), true), SCRATCH_CHUNK);
+        assert_eq!(chunk_for(Some("18446744073709551615"), true), SCRATCH_CHUNK);
+    }
+
     #[test]
     fn fills_merge_only_across_contiguous_bytes_of_one_upload() {
         let Some(gpu) =
@@ -1051,7 +1066,44 @@ struct Scratch {
 // SAFETY: the chunk pointers are persistent mappings of upload buffers.
 unsafe impl Send for Scratch {}
 
+/// The upload memory of one list scratch chunk, unless [`scratch_chunk`]
+/// says less.
 const SCRATCH_CHUNK: u64 = 4 << 20;
+/// A scratch chunk on a host with less than 32 GiB of RAM
+/// (`resource::pool::low_memory_host`). In a world session on such a host
+/// (16 GiB), 96 % of the lists' recordings used up to 256 KiB of scratch
+/// (33 KiB on average) and none more than 4 MiB, while each list kept a
+/// 4 MiB chunk: 278 chunks held 1.1 GiB of upload memory for 70 MiB used.
+/// With 256 KiB chunks they held 122 to 127 MiB, at the same frame rate
+/// (fogydes/XTP#45). A recording that needs more takes more chunks, and an
+/// allocation larger than a chunk its own buffer, as before.
+const SCRATCH_CHUNK_LOW: u64 = 256 << 10;
+
+/// The bytes of a list scratch chunk: `XTP_SCRATCH_CHUNK_KIB` (rounded up to
+/// 64 KiB, D3D12's buffer placement, at most [`SCRATCH_CHUNK`]), else
+/// [`SCRATCH_CHUNK_LOW`] on a host with less than 32 GiB of RAM, else
+/// [`SCRATCH_CHUNK`].
+fn scratch_chunk() -> u64 {
+    static BYTES: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *BYTES.get_or_init(|| {
+        let asked = std::env::var("XTP_SCRATCH_CHUNK_KIB").ok();
+        let bytes = chunk_for(asked.as_deref(), crate::resource::pool::low_memory_host());
+        if bytes != SCRATCH_CHUNK {
+            tracing::info!(kib = bytes >> 10, "list scratch chunks");
+        }
+        bytes
+    })
+}
+
+/// [`scratch_chunk`] for `XTP_SCRATCH_CHUNK_KIB`'s value and whether the
+/// host has less than 32 GiB of RAM.
+fn chunk_for(asked: Option<&str>, low_memory: bool) -> u64 {
+    match asked.map(str::trim).and_then(|v| v.parse::<u64>().ok()) {
+        Some(kib) if kib > 0 => (kib.min(SCRATCH_CHUNK >> 10) << 10).next_multiple_of(64 << 10),
+        _ if low_memory => SCRATCH_CHUNK_LOW,
+        _ => SCRATCH_CHUNK,
+    }
+}
 
 /// What a list reset while it ran leaves to its running submission.
 struct Retired {
@@ -3060,7 +3112,8 @@ impl HostList {
     fn scratch_region(&self, len: u64) -> Option<(u64, usize, usize)> {
         let host = host()?;
         let len = len.max(1).next_multiple_of(256);
-        if len > SCRATCH_CHUNK {
+        let chunk = scratch_chunk();
+        if len > chunk {
             let (buffer, data) = host.upload_buffer(len)?;
             name(&buffer, || format!("list scratch {len:#x}"));
             // SAFETY: a live buffer.
@@ -3069,7 +3122,7 @@ impl HostList {
             return Some((gpu, data as usize, 0));
         }
         let mut s = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
-        if s.used + len > SCRATCH_CHUNK && s.current < s.chunks.len() {
+        if s.used + len > chunk && s.current < s.chunks.len() {
             (s.current, s.used) = (s.current + 1, 0);
         }
         if s.current == s.chunks.len() {
@@ -3080,7 +3133,7 @@ impl HostList {
                     // Made without the lock held (it may wait for a heap);
                     // a list records on one thread at a time.
                     drop(s);
-                    let (buffer, data) = host.upload_buffer(SCRATCH_CHUNK)?;
+                    let (buffer, data) = host.upload_buffer(chunk)?;
                     name(&buffer, || "list scratch".into());
                     // SAFETY: a live buffer.
                     let gpu = unsafe { buffer.GetGPUVirtualAddress() };
