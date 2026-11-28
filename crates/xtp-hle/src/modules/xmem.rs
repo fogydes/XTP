@@ -884,10 +884,52 @@ struct Pages {
     table: HashMap<usize, Slice>,
 }
 
+/// The first page number given out; 0 stays unused.
+const FIRST_PAGE: usize = 0x10_0000;
+/// Numbers from here on do not survive the title's 21-bit `number >> 4`
+/// ([`FRAMES`]).
+const PAGE_LIMIT: usize = 1 << 25;
+
+impl Pages {
+    /// The first of `n` numbers, [`FRAMES`] apart, for new pages: after the
+    /// last given while they fit the title's 21 bits (as before), then the
+    /// lowest run of `n` freed ones. `None` if there is no such run.
+    fn take(&mut self, n: usize) -> Option<usize> {
+        let len = n.checked_mul(FRAMES)?;
+        let end = self.next.checked_add(len);
+        if let Some(end) = end.filter(|&end| end <= PAGE_LIMIT) {
+            let first = self.next;
+            self.next = end;
+            return Some(first);
+        }
+        static REUSING: std::sync::Once = std::sync::Once::new();
+        REUSING.call_once(|| {
+            tracing::info!("page numbers reach the title's 21 bits: freed ones given again");
+        });
+        let mut used: Vec<usize> = self.table.keys().copied().collect();
+        used.sort_unstable();
+        free_run(used, len)
+    }
+}
+
+/// The lowest `start` from [`FIRST_PAGE`] where `len` (a multiple of
+/// [`FRAMES`]) numbers up to [`PAGE_LIMIT`] are all outside `used`
+/// (sorted).
+fn free_run(used: impl IntoIterator<Item = usize>, len: usize) -> Option<usize> {
+    let mut start = FIRST_PAGE;
+    for at in used.into_iter().chain([PAGE_LIMIT]) {
+        if at.checked_sub(start).is_some_and(|gap| gap >= len) {
+            return Some(start);
+        }
+        start = start.max(at.checked_add(FRAMES)?);
+    }
+    None
+}
+
 static PAGES: LazyLock<RwLock<Pages>> = LazyLock::new(|| {
     RwLock::new(Pages {
-        // Page numbers are opaque to titles; 0 stays unused.
-        next: 0x10_0000,
+        // Page numbers are opaque to titles.
+        next: FIRST_PAGE,
         table: HashMap::new(),
     })
 });
@@ -1105,10 +1147,10 @@ pub extern "system" fn XMemAllocatePhysicalPages(
     // written (`Section::commit`).
     let section = Section::new(n);
     let bytes = (n * PAGE) as u64;
-    ledger::note(|l| l.handed_out(ledger::Kind::PhysicalPages, bytes, section.is_ok().into()));
     let section = match section {
         Ok(section) => Arc::new(section),
         Err(error) => {
+            ledger::note(|l| l.handed_out(ledger::Kind::PhysicalPages, bytes, 0));
             tracing::warn!(n, %error, "XMemAllocatePhysicalPages failed");
             // SAFETY: checked non-null.
             unsafe { count.write(0) };
@@ -1122,8 +1164,15 @@ pub extern "system" fn XMemAllocatePhysicalPages(
     );
     let first = {
         let mut table = page_table_mut();
-        let first = table.next;
-        table.next += n * FRAMES;
+        let Some(first) = table.take(n) else {
+            drop(table);
+            ledger::note(|l| l.handed_out(ledger::Kind::PhysicalPages, bytes, 0));
+            // The title keeps 21 bits of a number (`FRAMES`).
+            tracing::warn!(n, "XMemAllocatePhysicalPages: out of page numbers");
+            // SAFETY: checked non-null. The section goes with `section`.
+            unsafe { count.write(0) };
+            return 0;
+        };
         for index in 0..n {
             let slice = Slice {
                 section: section.clone(),
@@ -1133,6 +1182,7 @@ pub extern "system" fn XMemAllocatePhysicalPages(
         }
         first
     };
+    ledger::note(|l| l.handed_out(ledger::Kind::PhysicalPages, bytes, 1));
     for index in 0..n {
         // SAFETY: the title passes room for `n` page numbers.
         unsafe { pages.add(index).write(first + index * FRAMES) };
@@ -2139,6 +2189,28 @@ mod tests {
             assert!(report.contains("Windows paging file size"));
         }
         assert!(!fallback.contains("System commit:"));
+    }
+
+    #[test]
+    fn page_numbers_freed_are_given_again_past_the_title_s_21_bits() {
+        let mut table = Pages {
+            next: PAGE_LIMIT - 2 * FRAMES,
+            table: HashMap::new(),
+        };
+        // The last numbers that fit, as before.
+        assert_eq!(table.take(2), Some(PAGE_LIMIT - 2 * FRAMES));
+        assert_eq!(table.next, PAGE_LIMIT);
+        // Then the lowest free run, still packed into 21 bits.
+        assert_eq!(table.take(3), Some(FIRST_PAGE));
+        assert_eq!(table.take(usize::MAX), None);
+        let f = |k: usize| FIRST_PAGE + k * FRAMES;
+        assert_eq!(free_run([f(0), f(1), f(3)], FRAMES), Some(f(2)));
+        assert_eq!(free_run([f(0), f(1), f(3)], 2 * FRAMES), Some(f(4)));
+        assert_eq!(free_run([], PAGE_LIMIT - FIRST_PAGE), Some(FIRST_PAGE));
+        assert_eq!(free_run([f(0)], PAGE_LIMIT - FIRST_PAGE), None);
+        assert_eq!(free_run([], PAGE_LIMIT - FIRST_PAGE + FRAMES), None);
+        let p = free_run([PAGE_LIMIT - FRAMES], FRAMES).unwrap();
+        assert_eq!((p >> 4 & 0x1f_ffff) << 4, p);
     }
 
     #[test]
