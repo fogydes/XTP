@@ -45,6 +45,8 @@ pub(crate) struct Pending {
     /// Configured as a priority pipeline ([`configure_priority_pipelines`]):
     /// started early even on a cold cache and popped ahead of bulk draws.
     priority: bool,
+    /// Compute shader that traces or resolves BVH hits without an admitted builder.
+    rt_without_bvh: Option<&'static str>,
     /// [`IDLE`], [`EARLY`], [`URGENT`], [`PRIORITY`] or [`MAKING`]: the queue
     /// it was handed to last, or taken out of it. Changed under the queues' lock.
     queued: AtomicU8,
@@ -122,6 +124,41 @@ fn is_priority(shaders: &[Arc<Shader>]) -> bool {
         .is_some_and(|sorted| matches_priority(shaders, sorted))
 }
 
+fn named_compute(shaders: &[Arc<Shader>], name: &[u8]) -> bool {
+    shaders
+        .iter()
+        .any(|s| s.stage == "compute" && s.container.windows(name.len()).any(|w| w == name))
+}
+
+fn env_flag_enabled(name: &str) -> bool {
+    std::env::var_os(name).is_some_and(|v| v == "1")
+}
+
+/// Skip ray-tracing resolve and activation shaders when the BVH builder is
+/// held so cold heavy compiler threads are not clogged resolving empty hits.
+/// Adapted from `codec-d/cool_fox` (`GPL-3.0-or-later`).
+fn rt_without_bvh_reason(
+    shaders: &[Arc<Shader>],
+    allow_resolve: bool,
+    allow_activate: bool,
+) -> Option<&'static str> {
+    if !allow_resolve && named_compute(shaders, b"CS_RaytracingResolve") {
+        return Some("shades ray-tracing hits without BVH, left out");
+    }
+    if !allow_activate && named_compute(shaders, b"CS_ScreenProbes_ActivateRays") {
+        return Some("ray activation shader without BVH, left out");
+    }
+    None
+}
+
+fn rt_without_bvh(shaders: &[Arc<Shader>]) -> Option<&'static str> {
+    static ALLOW_RESOLVE: OnceLock<bool> = OnceLock::new();
+    static ALLOW_ACTIVATE: OnceLock<bool> = OnceLock::new();
+    let allow_resolve = *ALLOW_RESOLVE.get_or_init(|| env_flag_enabled("XTP_RT_RESOLVE"));
+    let allow_activate = *ALLOW_ACTIVATE.get_or_init(|| env_flag_enabled("XTP_ACTIVATE_RAYS"));
+    rt_without_bvh_reason(shaders, allow_resolve, allow_activate)
+}
+
 /// The pools: cheap pipelines, heavy ones ([`heavy`]).
 const CHEAP: usize = 0;
 const HEAVY: usize = 1;
@@ -155,11 +192,13 @@ impl Pending {
         stream: Option<super::record::Stream>,
     ) -> Pending {
         let priority = is_priority(&shaders);
+        let rt_without_bvh = rt_without_bvh(&shaders);
         Pending {
             key: key(&shaders, graphics.as_deref()),
             shaders,
             graphics,
             priority,
+            rt_without_bvh,
             queued: AtomicU8::new(IDLE),
             pool: AtomicU8::new(CHEAP as u8),
             made: OnceLock::new(),
@@ -291,6 +330,11 @@ fn heavy(p: &Pending) -> bool {
 /// one.
 #[cfg(feature = "diagnostics")]
 pub(crate) fn missing(p: &Pending) -> Option<(String, Option<String>)> {
+    if let Some(reason) = p.rt_without_bvh
+        && super::builder::held()
+    {
+        return Some((reason.into(), None));
+    }
     match p.made.get() {
         Some(Some(_)) => None,
         None => Some((format!("being made ({})", p.pool_name()), None)),
@@ -450,7 +494,7 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
 /// configured priority pipeline (even on a cold cache), or if an earlier run
 /// drew with it (during loading, so the world's first frames find it).
 pub(crate) fn early(p: &Arc<Pending>) {
-    if p.shaders.is_empty() {
+    if p.shaders.is_empty() || (p.rt_without_bvh.is_some() && super::builder::held()) {
         return;
     }
     if p.priority {
@@ -775,6 +819,9 @@ impl Pools {
         frame: u64,
         budget: Budget,
     ) -> Option<&'a HostPipeline> {
+        if p.rt_without_bvh.is_some() && super::builder::held() {
+            return None;
+        }
         if p.made.get().is_none() {
             self.start(p, if p.priority { PRIORITY } else { URGENT });
             if !heavy(p) {
@@ -1647,5 +1694,42 @@ mod tests {
         drop(release_bulk);
         until_finished(&bulk);
         assert!(matches!(bulk.made.get(), Some(Some(_))));
+    }
+
+    #[test]
+    fn rt_without_bvh_classifies_resolve_and_activation_compute_shaders() {
+        let compute_with = |tag: &[u8]| {
+            let mut container = b"header_".to_vec();
+            container.extend_from_slice(tag);
+            container.extend_from_slice(b"_variant");
+            vec![Arc::new(Shader {
+                stage: "compute",
+                hash: "0123456789abcdef".to_owned(),
+                #[cfg(windows)]
+                ambient: None,
+                container,
+                native: OnceLock::new(),
+                translated: OnceLock::new(),
+            })]
+        };
+        let resolve = compute_with(b"CS_RaytracingResolve");
+        let activate = compute_with(b"CS_ScreenProbes_ActivateRays");
+        let other = compute_with(b"CS_OtherCompute");
+        let vertex = vec![Arc::new(Shader {
+            stage: "vertex",
+            hash: "0123456789abcdef".to_owned(),
+            #[cfg(windows)]
+            ambient: None,
+            container: b"CS_RaytracingResolve".to_vec(),
+            native: OnceLock::new(),
+            translated: OnceLock::new(),
+        })];
+
+        assert!(rt_without_bvh_reason(&resolve, false, false).is_some());
+        assert!(rt_without_bvh_reason(&resolve, true, false).is_none());
+        assert!(rt_without_bvh_reason(&activate, false, false).is_some());
+        assert!(rt_without_bvh_reason(&activate, false, true).is_none());
+        assert!(rt_without_bvh_reason(&other, false, false).is_none());
+        assert!(rt_without_bvh_reason(&vertex, false, false).is_none());
     }
 }
