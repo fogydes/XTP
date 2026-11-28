@@ -2851,6 +2851,33 @@ fn decoding(
     })
 }
 
+/// A title texture held alive by an owned reference ([`alias::written_beside`]);
+/// the reference is released when this is dropped.
+#[cfg(windows)]
+pub(crate) struct Held(This);
+
+#[cfg(windows)]
+impl Held {
+    /// Pins `this` if it still has a live reference, returning `None` if it is
+    /// already being released. Must be called under the registry lock that
+    /// prevents `this` from being freed while its reference count is checked.
+    pub(super) fn pin(this: This) -> Option<Held> {
+        object::add_ref_alive(this).then_some(Held(this))
+    }
+
+    /// The texture this handle keeps alive.
+    pub(crate) fn get(&self) -> This {
+        self.0
+    }
+}
+
+#[cfg(windows)]
+impl Drop for Held {
+    fn drop(&mut self) {
+        object::release_boxed::<Resource>(self.0);
+    }
+}
+
 /// Transitions the source for copying and saves its previous state in case
 /// the command already bound it as a render target or UAV.
 #[cfg(windows)]
@@ -2914,7 +2941,7 @@ pub(crate) fn alias_copy(list: &crate::host::HostList, placed: This) -> bool {
     // The host has R9G9B9E5 as RGBA16F (`format`, the RTX 4080): texels
     // of another width, decoded rather than copied.
     if decodes(r.desc.format, &from, &to) {
-        let decoded = decode_now(list, host, placed, source as This, &from, &to);
+        let decoded = decode_now(list, host, placed, source.get(), &from, &to);
         if decoded {
             crate::texture::gpu_write(list, placed, true);
         }
@@ -2926,20 +2953,20 @@ pub(crate) fn alias_copy(list: &crate::host::HostList, placed: This) -> bool {
     const COPY_DEST: u32 = 0x400;
     const COPY_SOURCE: u32 = 0x800;
     const TARGET_OR_UNORDERED: u32 = 0x4 | 0x8;
-    let source = source as This;
+    let source_ptr = source.get();
     // Resources are 8-byte aligned: a key of the list's own for the copy.
     let first = list.first_use(placed as usize | 1);
     // The source's first use in the list records nothing (its prelude
     // brings it to the state); a use in another way since the last copy
     // shows as a change of state.
-    let before = alias_source(list, source, COPY_SOURCE);
+    let before = alias_source(list, source_ptr, COPY_SOURCE);
     crate::texture::gpu_write(list, placed, true);
     if !first && before.is_none() {
         return true;
     }
     crate::list::ensure_state(list, placed, COPY_DEST);
     #[cfg(feature = "diagnostics")]
-    list.note_op(|| format!("alias copy of {source:?} into {placed:?}"));
+    list.note_op(|| format!("alias copy of {source_ptr:?} into {placed:?}"));
     let part = |texture: &ID3D12Resource, index: usize| D3D12_TEXTURE_COPY_LOCATION {
         // SAFETY: a borrowed pointer the location never releases.
         pResource: unsafe { std::mem::transmute_copy(texture) },
@@ -2990,7 +3017,7 @@ pub(crate) fn alias_copy(list: &crate::host::HostList, placed: This) -> bool {
     if let Some(before) = before
         && before & TARGET_OR_UNORDERED != 0
     {
-        crate::list::ensure_state(list, source, before);
+        crate::list::ensure_state(list, source_ptr, before);
     }
     true
 }
@@ -4809,6 +4836,53 @@ mod tests {
         let same = texture_at(address, &words(&texture(16, 16, R32_FLOAT, 1), [3, 4])).unwrap();
         assert!(!alias_copy(reads.host(), same));
         assert_eq!(slot::<Release>(target, 0x10)(target), 0);
+    }
+
+    /// The source a placed view aliases is pinned under the registry's lock so
+    /// releasing the title's own reference between the lookup and the copy
+    /// keeps the source alive until the alias copy finishes.
+    #[cfg(windows)]
+    #[test]
+    fn an_alias_source_is_held_after_the_title_releases_it() {
+        let test = "resource::tests::an_alias_source_is_held_after_the_title_releases_it";
+        let Some(_gpu) = crate::testgpu::device(test) else {
+            return;
+        };
+        let mut held = Vec::new();
+        let memory = fresh_memory(&mut held);
+        let address = memory.address();
+        const R32_FLOAT: u32 = 41;
+        const R9G9B9E5: u32 = 67;
+        let source = at(
+            address,
+            &ResourceDesc {
+                flags: 1,
+                ..texture(4, 4, R32_FLOAT, 1)
+            },
+        );
+        resident(source);
+        let view = at(address, &texture(4, 4, R9G9B9E5, 1));
+        assert!(alias::has_sources(address), "source registered at address");
+        let (pinned, _host) =
+            alias::written_beside(address, &resource(view).desc).expect("an alias source");
+        assert_eq!(pinned.get(), source);
+        // The title drops its own reference: the pin keeps the source alive
+        // and registered so recording the alias copy still sees a live object.
+        assert_eq!(resource_release(source), 1);
+        assert!(
+            host_resource(pinned.get()).is_some(),
+            "a held source is still copyable"
+        );
+        assert!(
+            alias::has_sources(address),
+            "the held source is not unregistered yet"
+        );
+        drop(pinned);
+        assert!(
+            !alias::has_sources(address),
+            "dropping the last reference unregisters and frees it"
+        );
+        assert_eq!(resource_release(view), 0);
     }
 
     /// Where the host keeps R9G9B9E5 as RGBA16F (the RTX 4080), light

@@ -186,11 +186,14 @@ fn texel(format: u32) -> Option<u64> {
 /// by `want`, which the GPU does not write, reads in another format: one of
 /// the same shape (dimension, size, array or depth, levels, one sample)
 /// but another format family, texels as wide, and no depth. The title
-/// resource and its host copy. After fxceless's `alias_of`.
+/// resource is pinned under the registry's lock and returned held alongside
+/// its host copy so releasing the title's reference before the alias copy is
+/// recorded cannot free it; a source already being released is skipped.
+/// After fxceless's `alias_of` (and fork PR #1336).
 pub(super) fn written_beside(
     address: u64,
     want: &ResourceDesc,
-) -> Option<(usize, Arc<HostTexture>)> {
+) -> Option<(super::Held, Arc<HostTexture>)> {
     if super::host_flags(want.flags) & WRITABLE != 0 {
         return None;
     }
@@ -207,8 +210,14 @@ pub(super) fn written_beside(
             && want_shape.samples == 1
             && s.texel == Some(want_texel)
             && s.flags & DEPTH == 0;
-        fits.then(|| s.host.upgrade().map(|h| (s.resource, h)))
-            .flatten()
+        if !fits {
+            return None;
+        }
+        // Upgrade `host` first so a `Held` guard is never dropped while
+        // `SOURCES` is locked (the last release calls `unregister`).
+        let host = s.host.upgrade()?;
+        let held = super::Held::pin(s.resource as crate::object::This)?;
+        Some((held, host))
     })
 }
 

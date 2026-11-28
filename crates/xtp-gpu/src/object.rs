@@ -71,6 +71,17 @@ pub(crate) extern "system" fn add_ref(this: This) -> u32 {
     unsafe { &*this }.refs.fetch_add(1, Ordering::Relaxed) + 1
 }
 
+/// Adds a reference to `this` only while it still has at least one: returns
+/// `false` if its reference count has already reached 0 (being released).
+pub(crate) fn add_ref_alive(this: This) -> bool {
+    // SAFETY: `this` is one of our objects, not freed yet.
+    let refs = &unsafe { &*this }.refs;
+    refs.fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+        if n > 0 { n.checked_add(1) } else { None }
+    })
+    .is_ok()
+}
+
 pub(crate) extern "system" fn release(this: This) -> u32 {
     // SAFETY: `this` is one of our objects.
     let refs = &unsafe { &*this }.refs;
@@ -380,5 +391,18 @@ mod tests {
         );
         assert_eq!(g[..4], [0xf1, 0x19, 0x98, 0x18]);
         assert_eq!(guid_text(&g), "189819f1-1db6-4b57-be54-1821339b85f7");
+    }
+
+    #[test]
+    fn add_ref_alive_skips_zero_and_increments_live_objects() {
+        static TABLE: Table<3> = Table(missing_table::<0, 3>());
+        let obj = Object::new(&TABLE);
+        let this: This = &raw const obj;
+        assert!(!add_ref_alive(this), "zero refcount is never resurrected");
+        assert_eq!(add_ref(this), 1);
+        assert!(add_ref_alive(this));
+        assert_eq!(release(this), 1);
+        assert_eq!(release(this), 0);
+        assert!(!add_ref_alive(this), "released object is not resurrected");
     }
 }
