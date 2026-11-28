@@ -48,6 +48,8 @@ pub(crate) struct Pending {
     /// it. Changed under the queues' lock.
     pool: AtomicU8,
     made: OnceLock<Option<HostPipeline>>,
+    /// Microseconds title threads have waited for this pipeline across all frames.
+    waited_us: AtomicU64,
     /// Set by the call that made it, once what that call counts is in
     /// place ([`Pending::make`]).
     finished: AtomicBool,
@@ -116,6 +118,7 @@ impl Pending {
             queued: AtomicU8::new(IDLE),
             pool: AtomicU8::new(CHEAP as u8),
             made: OnceLock::new(),
+            waited_us: AtomicU64::new(0),
             finished: AtomicBool::new(false),
             used: AtomicBool::new(false),
             stream,
@@ -289,6 +292,26 @@ impl Budget {
     }
 }
 
+/// Default cumulative wait cap per unbuilt pipeline (`XTP_PIPELINE_WAIT_CAP_MS`).
+const DEFAULT_WAIT_CAP_MS: u64 = 5_000;
+
+fn parse_wait_cap_us(raw: Option<&str>) -> u64 {
+    match raw.and_then(|v| v.trim().parse::<u64>().ok()) {
+        Some(0) => u64::MAX,
+        Some(ms) => ms.saturating_mul(1_000),
+        None => DEFAULT_WAIT_CAP_MS * 1_000,
+    }
+}
+
+/// Total waiting allowed for one pipeline across all frames
+/// (`XTP_PIPELINE_WAIT_CAP_MS`, default 5000 ms; 0 disables the cap).
+fn wait_cap_us() -> u64 {
+    static CAP_US: OnceLock<u64> = OnceLock::new();
+    *CAP_US.get_or_init(|| {
+        parse_wait_cap_us(std::env::var("XTP_PIPELINE_WAIT_CAP_MS").ok().as_deref())
+    })
+}
+
 /// The waiting done in one title frame, per kind (graphics, compute).
 struct Frame {
     frame: AtomicU64,
@@ -398,8 +421,16 @@ fn builder_requires_every_host_pipeline() {
     assert_eq!(verdict(&[Some(true), Some(true)]), Some(true));
 }
 
-/// Waits for `p` while title frame `frame` has budget left for its kind.
+/// Waits for `p` while title frame `frame` has budget left for its kind and
+/// cumulative waiting for `p` stays under [`wait_cap_us`].
 fn wait(p: &Pending, frames: &Frame, frame: u64, budget: Budget) {
+    wait_with_cap(p, frames, frame, budget, wait_cap_us());
+}
+
+fn wait_with_cap(p: &Pending, frames: &Frame, frame: u64, budget: Budget, cap_us: u64) {
+    if p.waited_us.load(Ordering::Relaxed) >= cap_us {
+        return;
+    }
     let kind = usize::from(p.compute());
     let left = frames.left(frame, kind, budget);
     if left.is_zero() {
@@ -419,7 +450,12 @@ fn wait(p: &Pending, frames: &Frame, frame: u64, budget: Budget) {
             .0;
     }
     drop(held);
-    frames.add(kind, started.elapsed());
+    let waited = started.elapsed();
+    p.waited_us.fetch_add(
+        u64::try_from(waited.as_micros()).unwrap_or(u64::MAX),
+        Ordering::Relaxed,
+    );
+    frames.add(kind, waited);
 }
 
 /// One pool's pipelines: first uses first, then those started early. A
@@ -1318,5 +1354,38 @@ mod tests {
             "with one queue, the cheap one is made after the heavy one"
         );
         assert!(matches!(cheap.made.get(), Some(Some(_))));
+    }
+
+    #[test]
+    fn wait_cap_parsing_handles_defaults_zero_and_invalid() {
+        assert_eq!(parse_wait_cap_us(None), 5_000_000);
+        assert_eq!(parse_wait_cap_us(Some("0")), u64::MAX);
+        assert_eq!(parse_wait_cap_us(Some(" 0 \n")), u64::MAX);
+        assert_eq!(parse_wait_cap_us(Some("250")), 250_000);
+        assert_eq!(parse_wait_cap_us(Some("invalid")), 5_000_000);
+        assert_eq!(parse_wait_cap_us(Some("")), 5_000_000);
+        assert_eq!(parse_wait_cap_us(Some(&u64::MAX.to_string())), u64::MAX);
+    }
+
+    #[test]
+    fn cumulative_wait_cap_stops_spending_frame_budget_on_unbuilt_pipeline() {
+        let never = Pending::new(Vec::new(), None, None);
+        let frames = Frame::new();
+        let budget = Budget([Duration::from_millis(25), Duration::from_millis(25)]);
+        let cap_us = 20_000;
+
+        wait_with_cap(&never, &frames, 1, budget, cap_us);
+        assert!(never.waited_us.load(Ordering::Relaxed) >= cap_us);
+        assert!(frames.left(1, 0, budget).is_zero());
+
+        // Once the cumulative cap is reached, later frames return without spending budget.
+        let started = Instant::now();
+        wait_with_cap(&never, &frames, 2, budget, cap_us);
+        assert!(started.elapsed() < Duration::from_millis(10));
+        assert_eq!(frames.left(2, 0, budget), Duration::from_millis(25));
+
+        // Disabling the cap (u64::MAX) continues waiting in subsequent frames.
+        wait_with_cap(&never, &frames, 3, budget, u64::MAX);
+        assert!(frames.left(3, 0, budget).is_zero());
     }
 }
