@@ -645,3 +645,76 @@ fn a_descriptor_on_a_skipped_pixel_data_edge_needs_no_host_value() {
         })
     ));
 }
+
+/// `exp pos0, v2, v2, v2, v2 done`.
+const EXP_POS0_V2: [u32; 2] = [0xF800_08CF, 0x0202_0202];
+
+/// VOP3P `v_fma_mixlo_f16 v2, 2.0, 0.5, 1.0` (`high`: `v_fma_mixhi_f16`),
+/// f32 sources: 2.0 as an f16 into the low (high) half of v2.
+fn fma_mix_into_v2(high: bool) -> [u32; 2] {
+    const TWO: u32 = 244;
+    const HALF: u32 = 240;
+    const ONE: u32 = 242;
+    let op = if high { 0x22 } else { 0x21 };
+    [0x33 << 26 | op << 16 | 2, ONE << 18 | HALF << 9 | TWO]
+}
+
+/// Translates a hardware vertex program with no attributes and an
+/// `SV_Position` output.
+fn vertex(words: &[u32]) -> Result<HostShader, ShaderError> {
+    let native = NativeProgram {
+        stage: HwStage::Vs,
+        wave64: false,
+        float_mode: 0,
+        vgprs: 8,
+        layout: vec![],
+        used: vec![],
+        io: StageIo::Vs {
+            inputs: vec![],
+            outputs: vec![],
+        },
+        code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+    };
+    let mut position = element("SV_Position", 3, 0);
+    position.usage = 15;
+    let isg1 = container::signature(&[], true);
+    let osg1 = container::signature(&[position], false);
+    let bytes = dxbc::build(&[(FourCC::ISG1, &isg1), (FourCC::OSG1, &osg1)]);
+    let c = Container::parse(&bytes).unwrap();
+    crate::emit::translate_program(&c, &native).map_err(|(_, e)| e)
+}
+
+/// A hardware vertex program enters with the primitive id in v2, which a
+/// host vertex shader has no value for. A 16-bit write keeps the other half
+/// of its register (GFX10); written over v2, that half reads as 0, as with
+/// the other 16-bit writes, and the program translates. Before, this
+/// failed with the error `diff_tests`' "16-bit varyings and front face"
+/// reports for its vertex shader.
+#[test]
+fn a_half_written_over_the_vertex_primitive_id_translates() {
+    let [e0, e1] = EXP_POS0_V2;
+    let [lo0, lo1] = fma_mix_into_v2(false);
+    let [hi0, hi1] = fma_mix_into_v2(true);
+    for (what, words) in [
+        ("low half", vec![lo0, lo1, e0, e1, S_ENDPGM]),
+        ("high half", vec![hi0, hi1, e0, e1, S_ENDPGM]),
+        ("both halves", vec![lo0, lo1, hi0, hi1, e0, e1, S_ENDPGM]),
+    ] {
+        let vs = vertex(&words).unwrap_or_else(|e| panic!("{what}: {e}"));
+        validate(&vs);
+    }
+}
+
+/// The primitive id read as a 32-bit value is still refused: 0 there would
+/// be a wrong id for every primitive but the first.
+#[test]
+fn a_vertex_program_reading_the_primitive_id_is_refused() {
+    let [e0, e1] = EXP_POS0_V2;
+    assert!(matches!(
+        vertex(&[e0, e1, S_ENDPGM]),
+        Err(ShaderError::Unsupported {
+            what: "the primitive id",
+            ..
+        })
+    ));
+}

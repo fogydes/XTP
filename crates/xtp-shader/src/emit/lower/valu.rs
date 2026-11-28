@@ -607,27 +607,22 @@ impl<'a> Lower<'a> {
                 if v.clamp {
                     r = self.unary(7, r);
                 }
-                // The f16 result goes to one half; the other half stays.
+                // The f16 result goes to one half; the other half stays
+                // (GFX10). It is merged as the other 16-bit writes merge it
+                // (`place_bits`: SDWA word 1 or 0, the other word kept): an
+                // old value the host cannot supply reads as 0 there. A
+                // vertex shader's v2 holds the primitive id on entry, and
+                // the console compiler may write a half over it; a read of
+                // that id as a whole is still refused.
                 let Some(Operand::Vector { reg, .. }) = v.dst else {
                     return Err("a mixed-precision result");
-                };
-                let old = match inst.read(Reg::V(reg)) {
-                    Some(o) => self.i32_of(o)?,
-                    None => self.s.m.i32(0),
                 };
                 let h = self
                     .s
                     .op(c, "legacyF32ToF16", Attr::ReadNone, self.s.t.i32, 130, &[r]);
-                let (keep, h) = if name == "v_fma_mixhi_f16" {
-                    let k16 = self.s.m.i32(16);
-                    (0xFFFF, self.s.m.bin(c, Bin::Shl, h, k16))
-                } else {
-                    (0xFFFF_0000, h)
-                };
-                let keep = self.s.m.i32(keep);
-                let old = self.s.m.bin(c, Bin::And, old, keep);
-                let x = self.s.m.bin(c, Bin::Or, old, h);
-                self.write(inst, Reg::V(reg), x, guard);
+                let word = if name == "v_fma_mixhi_f16" { 5 } else { 4 };
+                let x = self.place_bits(inst, Reg::V(reg), h, word, 2);
+                self.write_placed(inst, Reg::V(reg), x, guard);
                 Ok(())
             }
             "v_cvt_pkrtz_f16_f32" => {
