@@ -80,16 +80,23 @@ impl Mode {
 struct Settings {
     mode: Mode,
     air: f32,
+    lamps: f32,
 }
 
 impl Settings {
     /// XTP_AMBIENT is off when unset, 0 or off. A positive number scales
     /// the estimate, and constant:<level> uses fixed light with crease shade.
     /// XTP_AMBIENT_AIR sets a positive cap multiplier in estimate mode.
+    /// XTP_AMBIENT_LAMPS sets a positive per-sample cap multiple of the slow
+    /// frame mean in estimate mode (bounded by 20).
     fn read() -> Self {
         Self {
             mode: Mode::parse(&std::env::var("XTP_AMBIENT").unwrap_or_default()),
             air: std::env::var("XTP_AMBIENT_AIR")
+                .ok()
+                .and_then(|text| positive(&text))
+                .unwrap_or_default(),
+            lamps: std::env::var("XTP_AMBIENT_LAMPS")
                 .ok()
                 .and_then(|text| positive(&text))
                 .unwrap_or_default(),
@@ -453,7 +460,7 @@ impl Passes {
             0.04f32.to_bits(),
             4.0f32.to_bits(),
             settings.air.to_bits(),
-            0,
+            settings.lamps.to_bits(),
         ];
         list.keep(&bound.image.resource);
         if let Some(depth) = &bound.depth {

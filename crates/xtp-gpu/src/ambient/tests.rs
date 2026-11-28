@@ -13,6 +13,14 @@ fn settings_and_role_table() {
     assert_eq!(Mode::parse("constant: 0.3"), Mode::Constant(0.3));
     assert_eq!(Mode::parse("constant:-1"), Mode::Off);
 
+    assert_eq!(positive("6"), Some(6.0));
+    assert_eq!(positive(" 1.5 "), Some(1.5));
+    assert_eq!(positive("0"), None);
+    assert_eq!(positive("-2"), None);
+    assert_eq!(positive("NaN"), None);
+    assert!(SOURCE.contains("float lamps;"));
+    assert!(SOURCE.contains("dot(c, LUMA) / bound"));
+
     let known = 0x0123_4567_89ab_cdef;
     let mut roles = HashMap::from([(known, Role::Resolve), (42, Role::Resolve)]);
     let mut invalid = Vec::new();
@@ -373,6 +381,7 @@ fn estimate_passes_use_radiance_and_bound_light() {
     let settings = Settings {
         mode: Mode::Estimate(0.8),
         air: 1.5,
+        lamps: 0.0,
     };
     let passes = Passes::make(&gpu.device, settings).unwrap();
     let scene = Scene::new(&gpu.device);
@@ -450,6 +459,7 @@ fn off_leaves_output_and_constant_works_without_history() {
     let settings = Settings {
         mode: Mode::Off,
         air: 1.5,
+        lamps: 0.0,
     };
     for role in [Role::Radiance, Role::Resolve, Role::Air] {
         assert!(!settings.record(&list, &scene.bound(role), || panic!(
@@ -460,6 +470,7 @@ fn off_leaves_output_and_constant_works_without_history() {
     let constant = Settings {
         mode: Mode::Constant(0.3),
         air: 1.5,
+        lamps: 0.0,
     };
     assert!(!constant.runs(Role::Radiance));
     assert!(!constant.runs(Role::Air));
@@ -481,6 +492,7 @@ fn estimate_skips_all_roles_without_r11_typed_uav_load() {
     let estimate = Settings {
         mode: Mode::Estimate(0.8),
         air: 1.5,
+        lamps: 0.0,
     };
     let passes = Passes::make_with_r11(&gpu.device, estimate, false).unwrap();
     assert!(passes.keep.is_none());
@@ -503,6 +515,7 @@ fn estimate_skips_all_roles_without_r11_typed_uav_load() {
     let constant = Settings {
         mode: Mode::Constant(0.3),
         air: 0.0,
+        lamps: 0.0,
     };
     assert!(passes.record(&list, constant, &scene.bound(Role::Resolve)));
     let lifted = Readback::copy(&gpu, &list, &scene.light);
@@ -513,4 +526,60 @@ fn estimate_skips_all_roles_without_r11_typed_uav_load() {
 
     assert_eq!(untouched.word(64, 36, 0), 123456);
     assert!((gray(lifted.word(64, 36, 0)) - 0.3).abs() < 0.002);
+}
+
+#[test]
+fn lamp_cap_limits_bright_radiance_relative_to_slow_mean() {
+    let Some(gpu) = testgpu::device("ambient lamp cap") else {
+        return;
+    };
+    let settings = Settings {
+        mode: Mode::Estimate(0.8),
+        air: 0.0,
+        lamps: 4.0,
+    };
+    let passes = Passes::make(&gpu.device, settings).unwrap();
+    let scene = Scene::new(&gpu.device);
+    let list = gpu.new_list().unwrap();
+    scene.prepare(&list);
+    let keep = scene.bound(Role::Radiance);
+    let resolve = scene.bound(Role::Resolve);
+
+    // Seed the slow frame mean at 0.5, then sample uniform 10.0 radiance.
+    // Uncapped it would resolve near 8.0; with a 4x lamp cap (2.0) it stays well under 3.0.
+    // SAFETY: the heap is bound and the radiance texture is a live UAV.
+    unsafe {
+        list.list.ClearUnorderedAccessViewFloat(
+            scene.gpu_at(RADIANCE),
+            scene.cpu_at(&scene.cpu, RADIANCE),
+            &scene.radiance,
+            &[0.5; 4],
+            &[],
+        );
+    }
+    assert!(passes.record(&list, settings, &keep));
+    // SAFETY: the heap is bound and the radiance texture is a live UAV.
+    unsafe {
+        list.list.ResourceBarrier(&[uav_barrier()]);
+        list.list.ClearUnorderedAccessViewFloat(
+            scene.gpu_at(RADIANCE),
+            scene.cpu_at(&scene.cpu, RADIANCE),
+            &scene.radiance,
+            &[10.0; 4],
+            &[],
+        );
+    }
+    assert!(passes.record(&list, settings, &keep));
+    scene.clear_light(&list, 0);
+    assert!(passes.record(&list, settings, &resolve));
+    let capped = Readback::copy(&gpu, &list, &scene.light);
+    list.close();
+    gpu.execute(&[&list]);
+    gpu.drain();
+
+    let level = gray(capped.word(64, 36, 0));
+    assert!(
+        level < 3.0,
+        "lamp cap did not bound bright radiance: {level}"
+    );
 }

@@ -11,7 +11,7 @@
 cbuffer Set : register(b0) {
     float level; float constant; float strength; float radius;
     float near; float tan_y; uint width; uint height;
-    float follow; float most; float air; float unused;
+    float follow; float most; float air; float lamps;
 };
 Texture2D<float> depth : register(t0);
 // Cells: the light they send out (then, at CELLS, the slow mean), from
@@ -37,13 +37,18 @@ RWTexture2D<float3> radiance : register(u0);
 void keep(uint3 at : SV_DispatchThreadID) {
     uint w, h;
     radiance.GetDimensions(w, h);
+    float bound = 20.0;
+    float4 slow = cells[CELLS];
+    if (lamps > 0.0 && slow.a > 0.0) {
+        bound = clamp(lamps * dot(slow.rgb, LUMA), 1e-4, 20.0);
+    }
     float3 sum = 0;
     for (uint y = 0; y < 5; y++) for (uint x = 0; x < 5; x++) {
         uint2 p = uint2((float2(at.xy) + (float2(x, y) + 0.5) / 5.0) * float2(w, h) / float2(CX, CY));
         float3 c = max(radiance[p], 0.0);
         c = any(isnan(c)) || any(isinf(c)) ? 0.0 : c;
         // Lamps and glints count, but not for everything.
-        sum += c / max(1.0, dot(c, LUMA) / 20.0);
+        sum += c / max(1.0, dot(c, LUMA) / bound);
     }
     cells[at.y * CX + at.x] = float4(sum / 25.0, 1.0);
 }
