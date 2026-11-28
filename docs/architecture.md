@@ -54,6 +54,13 @@ Radiance and estimate history follow execution order on the host queue.
 `XTP_RT_STANDIN` can clear a dropped trace to misses upstream, while
 `XTP_AMBIENT` works on the diffuse output of a resolve that ran.
 
+Ray-tracing dispatches reuse up to 64 host command signatures, keyed by
+the retained root signature, root SRV parameter and argument stride.
+The least recently used entry is evicted when full. Recordings keep
+their own COM references through completion, so eviction does not shorten
+the lifetime of an in-flight command signature. Creation failures are
+retried on later calls rather than cached.
+
 The pipeline cache uses a 1 GiB payload budget by default. Pass a byte
 budget to `Cache::open_with_limit`, or zero to disable disk access. When
 space is needed, the cache evicts entries in write-time order and skips

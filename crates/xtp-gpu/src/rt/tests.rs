@@ -1153,6 +1153,28 @@ fn rt_invalid_blas_inputs_are_refused_before_their_build() {
     assert!(translate(&unindexed), "three vertices without indices");
 }
 
+#[test]
+fn rt_trace_signatures_reuse_the_same_root_parameter_and_stride() {
+    let test = "rt_trace_signatures_reuse_the_same_root_parameter_and_stride";
+    let Some((gpu, _)) = dxr(test) else {
+        return;
+    };
+    let (root, _) = instances::compute_pass(
+        device(gpu.host()).unwrap(),
+        br#"[RootSignature("SRV(t0), SRV(t1)")]
+            [numthreads(1,1,1)] void main() {}"#,
+        windows::core::s!("signature_test"),
+    )
+    .unwrap();
+    let first = dispatch::signature(&root, 0, 20).unwrap();
+    let same = dispatch::signature(&root, 0, 20).unwrap();
+    assert_eq!(first.as_raw(), same.as_raw(), "reuse the driver object");
+    let other_param = dispatch::signature(&root, 1, 20).unwrap();
+    let other_stride = dispatch::signature(&root, 0, 24).unwrap();
+    assert_ne!(first.as_raw(), other_param.as_raw());
+    assert_ne!(first.as_raw(), other_stride.as_raw());
+}
+
 thread_local! {
     /// Set by a test to refuse the title's structures on its own thread,
     /// as `XTP_RT_BUILDS=0` does for a whole run ([`builds_on`]).

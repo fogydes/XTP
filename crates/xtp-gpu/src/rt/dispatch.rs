@@ -3,6 +3,7 @@
 //! still runs and writes its output, as on the console with an empty
 //! structure, instead of leaving what it wrote last frame.
 use super::*;
+use std::collections::VecDeque;
 use windows::core::s;
 
 /// Bytes of one direct trace command: the TLAS root SRV, then the groups.
@@ -18,6 +19,63 @@ const MAX_RECORDS: u32 = 1 << 16;
 const MAX_GROUPS: u32 = D3D12_CS_DISPATCH_MAX_THREAD_GROUPS_PER_DIMENSION;
 
 pub(super) fn signature(
+    root: &ID3D12RootSignature,
+    param: u32,
+    stride: u32,
+) -> Option<ID3D12CommandSignature> {
+    static CACHE: Mutex<Signatures> = Mutex::new(Signatures(VecDeque::new()));
+    CACHE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(root, param, stride)
+}
+
+/// A retained root prevents its COM address from being reused for a different
+/// signature. Lists retain the returned command signature independently, so
+/// eviction cannot release an object still referenced by GPU work.
+struct Signature {
+    root: ID3D12RootSignature,
+    param: u32,
+    stride: u32,
+    commands: ID3D12CommandSignature,
+}
+
+struct Signatures(VecDeque<Signature>);
+
+impl Signatures {
+    const LIMIT: usize = 64;
+
+    fn get(
+        &mut self,
+        root: &ID3D12RootSignature,
+        param: u32,
+        stride: u32,
+    ) -> Option<ID3D12CommandSignature> {
+        if let Some(i) = self.0.iter().rposition(|s| {
+            s.root.as_raw() == root.as_raw() && s.param == param && s.stride == stride
+        }) {
+            let hit = self.0.remove(i)?;
+            let commands = hit.commands.clone();
+            self.0.push_back(hit);
+            return Some(commands);
+        }
+        // Create under the lock, so concurrent first uses make it only once.
+        // A failed creation is not cached: a later request can retry it.
+        let commands = make_signature(root, param, stride)?;
+        if self.0.len() == Self::LIMIT {
+            self.0.pop_front();
+        }
+        self.0.push_back(Signature {
+            root: root.clone(),
+            param,
+            stride,
+            commands: commands.clone(),
+        });
+        Some(commands)
+    }
+}
+
+fn make_signature(
     root: &ID3D12RootSignature,
     param: u32,
     stride: u32,
@@ -346,3 +404,102 @@ fn compose_pass(
 }
 
 const _: () = assert!(MAX_GROUPS == 65535);
+
+#[cfg(test)]
+mod signature_tests {
+    use super::*;
+
+    #[test]
+    #[ignore = "CPU microbenchmark on a hardware D3D12 device"]
+    fn rt_signature_creation_timings() {
+        let Some(gpu) = crate::testgpu::device("rt_signature_creation_timings") else {
+            return;
+        };
+        let Some(device) = device(gpu.host()) else {
+            crate::testgpu::skip("rt_signature_creation_timings", "no DXR device");
+            return;
+        };
+        let (root, _) = instances::compute_pass(
+            device,
+            br#"[RootSignature("SRV(t0)")]
+                [numthreads(1,1,1)] void main() {}"#,
+            windows::core::s!("signature_timing_test"),
+        )
+        .unwrap();
+        const CALLS: u32 = 2000;
+        // Warm both paths; batches alternate their order to reduce drift.
+        signature(&root, 0, 20).unwrap();
+        make_signature(&root, 0, 20).unwrap();
+        for batch in 0..7 {
+            let mut times = [0u128; 2];
+            for mode in [batch % 2, 1 - batch % 2] {
+                let start = std::time::Instant::now();
+                for _ in 0..CALLS {
+                    let commands = if mode == 0 {
+                        make_signature(&root, 0, 20)
+                    } else {
+                        signature(&root, 0, 20)
+                    }
+                    .unwrap();
+                    std::hint::black_box(commands);
+                }
+                times[mode] = start.elapsed().as_nanos();
+            }
+            println!(
+                "signature_timing batch={batch} calls={CALLS} uncached_ns={} cached_ns={}",
+                times[0], times[1]
+            );
+        }
+    }
+
+    #[test]
+    fn rt_signature_cache_is_bounded_and_keeps_recent_entries() {
+        let Some(gpu) =
+            crate::testgpu::device("rt_signature_cache_is_bounded_and_keeps_recent_entries")
+        else {
+            return;
+        };
+        let Some(device) = device(gpu.host()) else {
+            crate::testgpu::skip(
+                "rt_signature_cache_is_bounded_and_keeps_recent_entries",
+                "no DXR device",
+            );
+            return;
+        };
+        let (root, _) = instances::compute_pass(
+            device,
+            br#"[RootSignature("SRV(t0)")]
+                [numthreads(1,1,1)] void main() {}"#,
+            windows::core::s!("signature_cache_test"),
+        )
+        .unwrap();
+        let mut cache = Signatures(VecDeque::new());
+        let first = cache.get(&root, 0, 20).unwrap();
+        let evicted = cache.get(&root, 0, 24).unwrap();
+        for i in 2..Signatures::LIMIT {
+            cache.get(&root, 0, 20 + 4 * i as u32).unwrap();
+        }
+        assert_eq!(cache.get(&root, 0, 20).unwrap().as_raw(), first.as_raw());
+        cache
+            .get(&root, 0, 20 + 4 * Signatures::LIMIT as u32)
+            .unwrap();
+        assert_eq!(cache.0.len(), Signatures::LIMIT);
+        assert!(
+            !cache
+                .0
+                .iter()
+                .any(|s| s.commands.as_raw() == evicted.as_raw())
+        );
+        assert_ne!(cache.get(&root, 0, 24).unwrap().as_raw(), evicted.as_raw());
+        assert_eq!(cache.0.len(), Signatures::LIMIT);
+        crate::testgpu::expect_layer_errors(|| {
+            assert!(cache.get(&root, 1, 20).is_none());
+            assert!(cache.get(&root, 1, 20).is_none());
+        });
+        assert_eq!(
+            cache.0.len(),
+            Signatures::LIMIT,
+            "failures are not retained"
+        );
+    }
+}
