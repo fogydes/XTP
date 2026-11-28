@@ -733,3 +733,116 @@ fn root_halfword_crosses_a_dword_and_typed_access_preserves_its_value() {
         .unwrap();
     assert_eq!(out[0], [0, 0xAB00_0000, 0x12, 0, 0x12AB, 0x12AB, 0x12AB, 0]);
 }
+
+/// Global byte and half loads use their full byte address, including a half
+/// at byte 3 of a dword. Signed loads extend the assembled field's sign bit.
+#[cfg(windows)]
+#[test]
+fn global_subword_loads_preserve_both_bytes_and_signedness() {
+    use super::host::{Dispatch, Host, Root, View};
+    let Some(host) = Host::test_device() else {
+        return;
+    };
+    let data = [0x80ff_7f01u32, 0x7fff_0081];
+    let bytes: Vec<_> = data.iter().flat_map(|w| w.to_le_bytes()).collect();
+    for (opcode, width, signed) in [(8, 1, false), (9, 1, true), (10, 2, false), (11, 2, true)] {
+        for offset in (0..8u32).chain([14, u32::MAX]) {
+            let overflow = offset == u32::MAX;
+            let address = if overflow {
+                [0x7E08_02FF, offset] // v4: scalar base's byte offset
+            } else {
+                [0x7E08_0208, 0x7E0A_0209] // v[4:5] = s[8:9]
+            };
+            let words = [
+                PTR.as_slice(),
+                &[
+                    0xF404_0201,
+                    0xFA00_0000, // s[8:9]: root UAV address
+                    0xBE8A_03C1,
+                    0xBE8B_03FF,
+                    0x3101_4FAC,
+                    0x7E04_02FF,
+                    data[0],
+                    0xE070_0000,
+                    0x8002_0200, // store source dword 0
+                    0x7E04_02FF,
+                    data[1],
+                    0xE070_0004,
+                    0x8002_0200, // store source dword 1
+                    0xBF8C_3F70, // s_waitcnt vmcnt(0)
+                    address[0],
+                    address[1],
+                    0xDC00_8000 | (opcode << 18) | if overflow { 0 } else { offset },
+                    if overflow { 0x0608_0004 } else { 0x067D_0004 }, // load into v6
+                    0xBF8C_3F70,
+                    0xE070_0008,
+                    0x8002_0600, // store v6 at byte 8
+                    END,
+                ],
+            ]
+            .concat();
+            let n = root_uav_program(&words, [1; 3], false);
+            let container = crate::dxbc::build(&[]);
+            let cs = translate_program(&Container::parse(&container).unwrap(), &n).unwrap();
+            if let Ok(mut v) = super::validator::Validator::load(
+                super::validator::Validator::default_path().as_deref(),
+            ) {
+                v.validate(&mut cs.dxil.clone()).unwrap();
+            }
+            let (root, pso) = host.compute_pipeline(&cs).unwrap();
+            let at = offset as usize;
+            let raw = if width == 1 {
+                u32::from(bytes.get(at).copied().unwrap_or(0))
+            } else {
+                u32::from(u16::from_le_bytes([
+                    bytes.get(at).copied().unwrap_or(0),
+                    bytes.get(at + 1).copied().unwrap_or(0),
+                ]))
+            };
+            let expected = match (width, signed) {
+                (1, true) => raw as u8 as i8 as i32 as u32,
+                (2, true) => raw as u16 as i16 as i32 as u32,
+                _ => raw,
+            };
+            for bias in [0, 4] {
+                if overflow && bias != 0 {
+                    continue;
+                }
+                let mut ud = vec![0; cs.user_data_dwords() as usize];
+                for u in &cs.user_data {
+                    if u.root == super::ROOT_UAV_BIAS {
+                        ud[u.index as usize] = bias;
+                    }
+                }
+                let out = host
+                    .dispatch(
+                        &root,
+                        &pso,
+                        &Dispatch {
+                            roots: vec![
+                                (0, Root::Constants(ud)),
+                                (
+                                    1,
+                                    Root::Table {
+                                        sampler: false,
+                                        index: 0,
+                                    },
+                                ),
+                            ],
+                            views: &[View::RawUav(4)],
+                            samplers: &[],
+                            groups: [1; 3],
+                        },
+                    )
+                    .unwrap();
+                let mut want = vec![0; 4];
+                let first = bias as usize / 4;
+                want[first..first + 3].copy_from_slice(&[data[0], data[1], expected]);
+                assert_eq!(
+                    out[0], want,
+                    "opcode {opcode}, offset {offset}, bias {bias}"
+                );
+            }
+        }
+    }
+}
