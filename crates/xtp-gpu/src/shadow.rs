@@ -958,12 +958,21 @@ impl Shadow {
         before: &mut [u8],
         synced: &mut Vec<usize>,
     ) -> usize {
+        let range_end = address + gpu.len();
+        let busy_writers: Vec<(usize, usize, u64)> = self
+            .busy()
+            .iter()
+            .filter(|b| {
+                b.shaders && b.submission == submission && b.from < range_end && address < b.to
+            })
+            .map(|b| (b.from, b.to, b.writer))
+            .collect();
         let mut written = 0;
         let mut at = 0;
         while at < gpu.len() {
             let next = (at + PAGE - (address + at) % PAGE).min(gpu.len());
             written += self.put_mapped_piece(
-                submission,
+                &busy_writers,
                 address + at,
                 &mut gpu[at..next],
                 &mut before[at..next],
@@ -976,7 +985,7 @@ impl Shadow {
 
     fn put_mapped_piece(
         &self,
-        submission: u64,
+        busy_writers: &[(usize, usize, u64)],
         address: usize,
         gpu: &mut [u8],
         before: &mut [u8],
@@ -984,16 +993,11 @@ impl Shadow {
     ) -> usize {
         let start = self.start as usize;
         let from = address - start;
-        let writer = self
-            .busy()
+        let piece_end = address + gpu.len();
+        let writer = busy_writers
             .iter()
-            .find(|b| {
-                b.shaders
-                    && b.submission == submission
-                    && b.from < address + gpu.len()
-                    && address < b.to
-            })
-            .map_or(0, |b| b.writer);
+            .find(|&&(b_from, b_to, _)| b_from < piece_end && address < b_to)
+            .map_or(0, |&(_, _, w)| w);
         let written = self
             .publish_piece(address, writer, gpu, Some(before))
             .unwrap_or_else(|| self.put_back(from, from + gpu.len(), gpu, before, synced).0);
@@ -1219,15 +1223,41 @@ impl Shadow {
                 static RUNS: std::cell::RefCell<Vec<(usize, usize)>> =
                     const { std::cell::RefCell::new(Vec::new()) };
             }
+            let title_unchanged = !crate::compare::differ(title, old);
             RUNS.with_borrow_mut(|runs| {
                 crate::compare::word_runs(at, host, old, runs);
-                let mut cursor = 0;
-                for &(from, len) in runs.iter() {
-                    host[cursor..from].copy_from_slice(&title[cursor..from]);
-                    merge_span(from, from + len, host, &mut written, &mut opened);
-                    cursor = from + len;
+                if title_unchanged {
+                    for &(from, len) in runs.iter() {
+                        let end = from + len;
+                        let mut i = from;
+                        while i < end {
+                            let run = first_change(&host[..end], &old[..end], i);
+                            if run == end {
+                                break;
+                            }
+                            i = first_same(&host[..end], &old[..end], run);
+                            if !opened {
+                                // The piece's guard, once.
+                                crate::watch::writing(at, piece_len);
+                                opened = true;
+                            }
+                            write_title(at + run, host[run..].as_ptr(), i - run);
+                            written += i - run;
+                            #[cfg(any(test, feature = "diagnostics"))]
+                            census::wrote(at + run, i - run);
+                            #[cfg(feature = "diagnostics")]
+                            crate::copystat::add(crate::copystat::C::BackRuns, 1);
+                        }
+                    }
+                } else {
+                    let mut cursor = 0;
+                    for &(from, len) in runs.iter() {
+                        host[cursor..from].copy_from_slice(&title[cursor..from]);
+                        merge_span(from, from + len, host, &mut written, &mut opened);
+                        cursor = from + len;
+                    }
+                    host[cursor..].copy_from_slice(&title[cursor..]);
                 }
-                host[cursor..].copy_from_slice(&title[cursor..]);
             });
         } else {
             merge_span(0, piece_len, host, &mut written, &mut opened);
@@ -1252,17 +1282,23 @@ impl Shadow {
             return;
         };
         let start = self.start as usize;
-        let mut title = vec![0u8; PAGE];
-        let current: Vec<usize> = pages
-            .iter()
-            .copied()
-            .filter(|&page| {
-                let from = page * PAGE - start;
-                // SAFETY: a whole page inside the mapping.
-                let host = unsafe { std::slice::from_raw_parts(self.data.add(from), PAGE) };
-                read_whole(page * PAGE, &mut title) && *host == *title
-            })
-            .collect();
+        thread_local! {
+            static TITLE: std::cell::RefCell<Vec<u8>> =
+                const { std::cell::RefCell::new(Vec::new()) };
+        }
+        let current: Vec<usize> = TITLE.with_borrow_mut(|title| {
+            title.resize(PAGE, 0);
+            pages
+                .iter()
+                .copied()
+                .filter(|&page| {
+                    let from = page * PAGE - start;
+                    // SAFETY: a whole page inside the mapping.
+                    let host = unsafe { std::slice::from_raw_parts(self.data.add(from), PAGE) };
+                    read_whole(page * PAGE, title) && !crate::compare::differ(host, title)
+                })
+                .collect()
+        });
         let base = start / PAGE;
         let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
         for page in current {
@@ -1397,6 +1433,26 @@ impl Shadow {
     /// Asks the write journal, which keeps the answer for the
     /// refresh that follows. (Marvisak/VIctory#595, for refreshes that
     /// overlap what an earlier submission's GPU work writes.)
+    /// Like [`Self::stale`], assuming the write journal already holds answers
+    /// for `[from, to)` (for example after [`crate::watch::poll_merged`]).
+    pub(crate) fn stale_polled(&self, from: usize, to: usize) -> bool {
+        let (start, end) = (self.start as usize, (self.start + self.len) as usize);
+        let (from, to) = (from.max(start), to.min(end));
+        if from >= to {
+            return false;
+        }
+        if self.watched.load(Ordering::Relaxed) == NOT_WATCHED {
+            return true;
+        }
+        let base = start / PAGE;
+        let copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+        (from / PAGE..=(to - 1) / PAGE).any(|page| {
+            let write = crate::watch::last_write(page);
+            let at = page * PAGE;
+            !copied[page - base].holds(from.max(at) - at, to.min(at + PAGE) - at, write)
+        })
+    }
+
     pub(crate) fn stale(&self, from: usize, to: usize) -> bool {
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let (from, to) = (from.max(start), to.min(end));
@@ -1409,13 +1465,7 @@ impl Shadow {
         if crate::watch::writes(from, to, true).is_none() {
             return true;
         }
-        let base = start / PAGE;
-        let copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
-        (from / PAGE..=(to - 1) / PAGE).any(|page| {
-            let write = crate::watch::last_write(page);
-            let at = page * PAGE;
-            !copied[page - base].holds(from.max(at) - at, to.min(at + PAGE) - at, write)
-        })
+        self.stale_polled(from, to)
     }
 
     /// [`Shadow::update_gaps`] of `[from, to)` (inside the buffer) where no
@@ -7967,5 +8017,84 @@ mod tests {
         );
         unregister(0x5eed_0001, slow.0 as u64);
         unregister(0x5eed_0002, quick.0 as u64);
+    }
+
+    #[test]
+    fn write_gpu_runs_fast_path_matches_three_way_merge() {
+        let test = "shadow::tests::write_gpu_runs_fast_path_matches_three_way_merge";
+        let Some(_gpu) = crate::testgpu::device(test) else {
+            return;
+        };
+        let w_fast = watched(PAGE);
+        let w_slow = watched(PAGE);
+        register(0x5eed_1001, w_fast as u64, PAGE as u64);
+        register(0x5eed_1002, w_slow as u64, PAGE as u64);
+        let shadow_fast = find(w_fast as u64, PAGE as u64).unwrap();
+        let shadow_slow = find(w_slow as u64, PAGE as u64).unwrap();
+
+        let old: Vec<u8> = (0..PAGE)
+            .map(|i| (i.wrapping_mul(17) ^ 0x5a) as u8)
+            .collect();
+        let title_fast = old.clone();
+        let mut title_slow = old.clone();
+        title_slow[0] ^= 0xff;
+        // SAFETY: both title slices fit inside their committed `PAGE` windows.
+        unsafe {
+            std::ptr::copy_nonoverlapping(title_fast.as_ptr(), w_fast as *mut u8, PAGE);
+            std::ptr::copy_nonoverlapping(title_slow.as_ptr(), w_slow as *mut u8, PAGE);
+        }
+        let mut host_fast = old.clone();
+        let mut host_slow = old.clone();
+        for &(from, len) in &[(64usize, 13usize), (512, 64), (4099, 250), (PAGE - 16, 16)] {
+            for k in from..from + len {
+                host_fast[k] ^= 0x33;
+                host_slow[k] ^= 0x33;
+            }
+        }
+        let written_fast = shadow_fast.write_gpu_runs(w_fast, &mut host_fast, &old, &title_fast);
+        let written_slow = shadow_slow.write_gpu_runs(w_slow, &mut host_slow, &old, &title_slow);
+        assert_eq!(written_fast, written_slow);
+        assert_eq!(host_fast[64..], host_slow[64..]);
+        // SAFETY: both title windows remain mapped until unregister below.
+        let (mem_fast, mem_slow) = unsafe {
+            (
+                std::slice::from_raw_parts(w_fast as *const u8, PAGE),
+                std::slice::from_raw_parts(w_slow as *const u8, PAGE),
+            )
+        };
+        assert_eq!(mem_fast[64..], mem_slow[64..]);
+
+        unregister(0x5eed_1001, w_fast as u64);
+        unregister(0x5eed_1002, w_slow as u64);
+    }
+
+    #[test]
+    fn stale_polled_matches_stale_after_poll_merged() {
+        let test = "shadow::tests::stale_polled_matches_stale_after_poll_merged";
+        let Some(_gpu) = crate::testgpu::device(test) else {
+            return;
+        };
+        let window = watched(2 * PAGE);
+        register(0x5eed_1003, window as u64, (2 * PAGE) as u64);
+        let shadow = find(window as u64, PAGE as u64).unwrap();
+        assert_eq!(shadow.update(window, 2 * PAGE), 2 * PAGE);
+
+        let p0 = window / PAGE;
+        let (polled, unwatched) = crate::watch::poll_merged(&[(p0, p0 + 2)]);
+        assert_ne!(polled, 0);
+        assert!(unwatched.is_empty());
+        assert!(!shadow.stale_polled(window, window + 2 * PAGE));
+        assert!(!shadow.stale(window, window + 2 * PAGE));
+
+        // SAFETY: `window` is a committed writable allocation of `2 * PAGE` bytes.
+        unsafe { ((window + PAGE + 128) as *mut u8).write_volatile(0x7e) };
+        let (polled, unwatched) = crate::watch::poll_merged(&[(p0, p0 + 2)]);
+        assert_ne!(polled, 0);
+        assert!(unwatched.is_empty());
+        assert!(!shadow.stale_polled(window, window + PAGE));
+        assert!(shadow.stale_polled(window + PAGE, window + 2 * PAGE));
+        assert!(shadow.stale(window + PAGE, window + 2 * PAGE));
+
+        unregister(0x5eed_1003, window as u64);
     }
 }

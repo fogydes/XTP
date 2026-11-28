@@ -750,6 +750,39 @@ mod tests {
     }
 
     #[test]
+    fn flush_before_writes_flushes_only_overlapping_ranges() {
+        let Some(_gpu) =
+            crate::testgpu::device("flush_before_writes_flushes_only_overlapping_ranges")
+        else {
+            return;
+        };
+        let buf_a = crate::testgpu::TitleBuffer::new(256);
+        let buf_b = crate::testgpu::TitleBuffer::new(256);
+        let shadow_a = buf_a.shadow();
+        let shadow_b = buf_b.shadow();
+        let base_a = buf_a.address() as usize;
+        let base_b = buf_b.address() as usize;
+        let mut batch = Batch::default();
+        batch.add(&shadow_a, base_a, 16);
+        batch.add(&shadow_a, base_a + 64, 16);
+        batch.add(&shadow_b, base_b, 16);
+
+        batch.flush_before_writes(&[(
+            shadow_a.clone(),
+            (base_a + 12) as u64,
+            (base_a + 32) as u64,
+        )]);
+        let remaining: Vec<_> = batch
+            .refreshes
+            .iter()
+            .map(|(s, a, z)| (std::sync::Arc::ptr_eq(s, &shadow_a), *a, *z))
+            .collect();
+        assert_eq!(remaining.len(), 2);
+        assert!(remaining.contains(&(true, base_a + 64, base_a + 80)));
+        assert!(remaining.contains(&(false, base_b, base_b + 16)));
+    }
+
+    #[test]
     fn wide_fills_finish_before_a_host_callback_and_keep_overlapping_fill_order() {
         let Some(gpu) = crate::testgpu::device("wide_fills_finish_before_a_host_callback") else {
             return;
@@ -3815,10 +3848,8 @@ impl HostList {
                         add(C::Refreshes, 1);
                         add(C::RefreshBytes, *len as u64);
                     }
-                    // Title memory an earlier submission's GPU work writes
-                    // is current only once that one is written back, if the
-                    // title wrote it since the copy took it.
-                    batch.settle_refresh(shadow, *address, *len);
+                    // Coalesce overlapping refreshes before settling in-flight
+                    // GPU work and flushing.
                     batch.add(shadow, *address, *len);
                     Kind::Refresh
                 }
@@ -3851,7 +3882,7 @@ impl HostList {
                     // an earlier submission's GPU work may still be writing;
                     // the shaders start from the title's data.
                     batch.settle(*address, *len, false);
-                    batch.flush();
+                    batch.flush_before_copy(shadow, *address, *len);
                     let _snapshot = (!shadow.carded()).then(|| Phase::Snapshots.enter());
                     shadow.writing_by(batch.submission, *address, *len, *writer);
                     Kind::GpuWrite
@@ -3920,14 +3951,13 @@ impl HostList {
                             add(C::Refreshes, 1);
                             add(C::RefreshBytes, len as u64);
                         }
-                        batch.settle_refresh(shadow, address, len);
                         batch.add(shadow, address, len);
                     }
                     if !writes.is_empty() {
                         for (_, from, to) in &writes {
                             batch.settle(*from as usize, (to - from) as usize, false);
                         }
-                        batch.flush();
+                        batch.flush_before_writes(&writes);
                         for (shadow, from, to) in &writes {
                             let _snapshot = (!shadow.carded()).then(|| Phase::Snapshots.enter());
                             let (address, len) = (*from as usize, (to - from) as usize);
@@ -3984,30 +4014,6 @@ impl Batch<'_> {
     fn settle(&self, address: usize, len: usize, writing: bool) {
         if let Some(host) = self.host {
             host.settle_range(address, len, writing);
-        }
-    }
-
-    /// Before a refresh of `[address, address + len)` of `shadow`: as
-    /// [`Batch::settle`], but a submission whose shaders or copies write
-    /// the range through the same host copy is waited for only if the
-    /// title wrote a page of the overlap since the copy took it (the
-    /// world's big heap is both refreshed and written on the GPU in most
-    /// submissions).
-    #[track_caller]
-    fn settle_refresh(
-        &self,
-        shadow: &std::sync::Arc<crate::shadow::Shadow>,
-        address: usize,
-        len: usize,
-    ) {
-        let Some(host) = self.host else { return };
-        let copy = std::sync::Arc::as_ptr(shadow) as usize;
-        let to = address.saturating_add(len);
-        if let Some(value) = host
-            .timeline
-            .refresh_conflict(copy, address, to, |a, b| shadow.stale(a, b))
-        {
-            host.settle(value);
         }
     }
 
@@ -4183,10 +4189,41 @@ impl Batch<'_> {
             .partition_point(|(s, _, to)| (std::sync::Arc::as_ptr(s), *to) <= (key, at));
         let count = self.refreshes[first..]
             .partition_point(|(s, from, _)| (std::sync::Arc::as_ptr(s), *from) < (key, end));
-        for (shadow, from, to) in self.refreshes.drain(first..first + count) {
-            let _copy = Phase::Copies.enter();
-            self.work.copy_bytes += Self::refresh_inner(&shadow, from, to) as u64;
+        if count == 0 {
+            return;
         }
+        let drained: Vec<_> = self.refreshes.drain(first..first + count).collect();
+        self.flush_ranges(&drained, crate::workers::wide());
+    }
+
+    /// Flushes only pending refreshes that overlap any `(shadow, from, to)`
+    /// range about to be written on the GPU.
+    fn flush_before_writes(
+        &mut self,
+        writes: &[(std::sync::Arc<crate::shadow::Shadow>, u64, u64)],
+    ) {
+        if self.refreshes.is_empty() || writes.is_empty() {
+            return;
+        }
+        let mut drained = Vec::new();
+        let mut i = 0;
+        while i < self.refreshes.len() {
+            let overlaps = {
+                let (ref s, r_from, r_to) = self.refreshes[i];
+                let s_ptr = std::sync::Arc::as_ptr(s);
+                writes.iter().any(|(w_s, w_from, w_to)| {
+                    std::sync::Arc::as_ptr(w_s) == s_ptr
+                        && (*w_from as usize) < r_to
+                        && r_from < (*w_to as usize)
+                })
+            };
+            if overlaps {
+                drained.push(self.refreshes.remove(i));
+            } else {
+                i += 1;
+            }
+        }
+        self.flush_ranges(&drained, crate::workers::wide());
     }
 
     fn flush(&mut self) {
@@ -4200,50 +4237,93 @@ impl Batch<'_> {
         if self.refreshes.is_empty() {
             return;
         }
-        let (polled_now, unwatched) = if self.refreshes.len() > 1 {
-            let page_ranges: Vec<(usize, usize)> = self
-                .refreshes
-                .iter()
-                .filter(|(s, from, to)| from < to && s.can_batch_poll())
-                .map(|(_, from, to)| (from / crate::watch::PAGE, to.div_ceil(crate::watch::PAGE)))
-                .collect();
-            crate::watch::poll_merged(&page_ranges)
-        } else {
-            (0, Vec::new())
+        let ranges = std::mem::take(&mut self.refreshes);
+        self.flush_ranges(&ranges, wide);
+    }
+
+    #[track_caller]
+    fn flush_ranges(
+        &mut self,
+        ranges: &[(std::sync::Arc<crate::shadow::Shadow>, usize, usize)],
+        wide: bool,
+    ) {
+        if ranges.is_empty() {
+            return;
+        }
+        let poll_ranges = |ranges: &[(std::sync::Arc<crate::shadow::Shadow>, usize, usize)]| {
+            if ranges.len() > 1 || self.host.is_some() {
+                let page_ranges: Vec<(usize, usize)> = ranges
+                    .iter()
+                    .filter(|(s, from, to)| from < to && s.can_batch_poll())
+                    .map(|(_, from, to)| {
+                        (from / crate::watch::PAGE, to.div_ceil(crate::watch::PAGE))
+                    })
+                    .collect();
+                crate::watch::poll_merged(&page_ranges)
+            } else {
+                (0, Vec::new())
+            }
         };
-        let refresh = |shadow: &crate::shadow::Shadow, from: usize, to: usize| {
-            if polled_now != 0 && from < to && shadow.can_batch_poll() {
-                let first = from / crate::watch::PAGE;
-                let last = to.div_ceil(crate::watch::PAGE);
-                let i = unwatched.partition_point(|&(_, e)| e <= first);
-                if unwatched.get(i).is_none_or(|&(a, _)| a >= last) {
-                    return Self::refresh_inner_polled(shadow, from, to, polled_now);
+        let is_polled = |shadow: &crate::shadow::Shadow,
+                         from: usize,
+                         to: usize,
+                         polled_now: u64,
+                         unwatched: &[(usize, usize)]| {
+            if polled_now == 0 || from >= to || !shadow.can_batch_poll() {
+                return false;
+            }
+            let first = from / crate::watch::PAGE;
+            let last = to.div_ceil(crate::watch::PAGE);
+            let i = unwatched.partition_point(|&(_, e)| e <= first);
+            unwatched.get(i).is_none_or(|&(a, _)| a >= last)
+        };
+        let (mut polled_now, mut unwatched) = poll_ranges(ranges);
+        if let Some(host) = self.host {
+            let mut max_settle: Option<u64> = None;
+            for (shadow, from, to) in ranges {
+                let copy = std::sync::Arc::as_ptr(shadow) as usize;
+                let can_stale_polled = is_polled(shadow, *from, *to, polled_now, &unwatched);
+                if let Some(value) = host.timeline.refresh_conflict(copy, *from, *to, |a, b| {
+                    if can_stale_polled {
+                        shadow.stale_polled(a, b)
+                    } else {
+                        shadow.stale(a, b)
+                    }
+                }) {
+                    max_settle = Some(max_settle.map_or(value, |cur| cur.max(value)));
                 }
             }
-            Self::refresh_inner(shadow, from, to)
+            if let Some(value) = max_settle {
+                host.settle(value);
+                (polled_now, unwatched) = poll_ranges(ranges);
+            }
+        }
+        let refresh = |shadow: &crate::shadow::Shadow, from: usize, to: usize| {
+            if is_polled(shadow, from, to, polled_now, &unwatched) {
+                Self::refresh_inner_polled(shadow, from, to, polled_now)
+            } else {
+                Self::refresh_inner(shadow, from, to)
+            }
         };
         let one_shadow = std::sync::Arc::ptr_eq(
-            &self.refreshes.first().expect("nonempty").0,
-            &self.refreshes.last().expect("nonempty").0,
+            &ranges.first().expect("nonempty").0,
+            &ranges.last().expect("nonempty").0,
         );
         if !wide || one_shadow {
-            for (shadow, from, to) in self.refreshes.drain(..) {
+            for (shadow, from, to) in ranges {
                 let _copy = Phase::Copies.enter();
-                self.work.copy_bytes += refresh(&shadow, from, to) as u64;
+                self.work.copy_bytes += refresh(shadow, *from, *to) as u64;
             }
             return;
         }
         let _copy = Phase::Copies.enter();
-        let refreshes = &self.refreshes;
-        // `refreshes` is sorted by `(Arc::as_ptr(shadow), from)`, so each
+        // `ranges` is sorted by `(Arc::as_ptr(shadow), from)`, so each
         // contiguous run belongs to one shadow.
         let mut groups: Vec<std::ops::Range<usize>> = Vec::new();
         let mut start = 0;
-        while start < refreshes.len() {
+        while start < ranges.len() {
             let mut end = start + 1;
-            while end < refreshes.len()
-                && std::sync::Arc::ptr_eq(&refreshes[start].0, &refreshes[end].0)
-            {
+            while end < ranges.len() && std::sync::Arc::ptr_eq(&ranges[start].0, &ranges[end].0) {
                 end += 1;
             }
             groups.push(start..end);
@@ -4252,12 +4332,11 @@ impl Batch<'_> {
         let copied = std::sync::atomic::AtomicUsize::new(0);
         crate::workers::each_wide(groups.len(), &|g| {
             let mut mine = 0usize;
-            for (shadow, from, to) in &refreshes[groups[g].clone()] {
+            for (shadow, from, to) in &ranges[groups[g].clone()] {
                 mine += refresh(shadow, *from, *to);
             }
             copied.fetch_add(mine, Ordering::Relaxed);
         });
-        self.refreshes.clear();
         self.work.copy_bytes += copied.into_inner() as u64;
     }
 
