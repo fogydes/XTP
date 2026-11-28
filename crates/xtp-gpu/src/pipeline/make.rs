@@ -42,8 +42,11 @@ use super::host::{GraphicsState, HostPipeline};
 pub(crate) struct Pending {
     shaders: Vec<Arc<Shader>>,
     pub(crate) graphics: Option<Box<GraphicsState>>,
-    /// [`IDLE`], [`EARLY`], [`URGENT`] or [`MAKING`]: the queue it was
-    /// handed to last, or taken out of it. Changed under the queues' lock.
+    /// Configured as a priority pipeline ([`configure_priority_pipelines`]):
+    /// started early even on a cold cache and popped ahead of bulk draws.
+    priority: bool,
+    /// [`IDLE`], [`EARLY`], [`URGENT`], [`PRIORITY`] or [`MAKING`]: the queue
+    /// it was handed to last, or taken out of it. Changed under the queues' lock.
     queued: AtomicU8,
     /// [`CHEAP`] or [`HEAVY`]: the pool it was handed to last, which makes
     /// it. Changed under the queues' lock.
@@ -72,13 +75,52 @@ unsafe impl Send for Pending {}
 // SAFETY: as above.
 unsafe impl Sync for Pending {}
 
-/// Not queued yet; queued as started early; queued for a first use; taken
-/// by the worker that makes it (VIctory #546: a pipeline is never handed to
-/// a second worker, which would wait on the first's compile).
+/// Not queued yet; queued as started early; queued for a first use; queued
+/// as a configured priority pipeline; taken by the worker that makes it
+/// (VIctory #546: a pipeline is never handed to a second worker, which would
+/// wait on the first's compile).
 const IDLE: u8 = 0;
 const EARLY: u8 = 1;
 const URGENT: u8 = 2;
-const MAKING: u8 = 3;
+const PRIORITY: u8 = 3;
+const MAKING: u8 = 4;
+
+/// Sorted 64-bit shader hashes configured via [`configure_priority_pipelines`].
+static PRIORITY_SHADERS: OnceLock<Vec<u64>> = OnceLock::new();
+
+/// Registers shader hashes whose pipelines jump ahead of normal draws in the
+/// worker queue and start compiling at creation even on a cold cache (for
+/// example, auto-exposure or first-scene compute producers whose absence
+/// leaves the scene black). Each hash is the first eight BLAKE3 bytes in
+/// big-endian order (the 16 hex digits logged for a shader). Subsequent calls
+/// keep the first registration.
+pub fn configure_priority_pipelines(hashes: &[u64]) {
+    let _ = PRIORITY_SHADERS.get_or_init(|| {
+        let mut sorted = hashes.to_vec();
+        sorted.sort_unstable();
+        sorted.dedup();
+        sorted
+    });
+}
+
+fn parse_shader_hash(text: &str) -> Option<u64> {
+    (text.len() == 16 && text.bytes().all(|b| b.is_ascii_hexdigit()))
+        .then(|| u64::from_str_radix(text, 16).ok())
+        .flatten()
+}
+
+fn matches_priority(shaders: &[Arc<Shader>], sorted: &[u64]) -> bool {
+    !sorted.is_empty()
+        && shaders
+            .iter()
+            .any(|s| parse_shader_hash(&s.hash).is_some_and(|h| sorted.binary_search(&h).is_ok()))
+}
+
+fn is_priority(shaders: &[Arc<Shader>]) -> bool {
+    PRIORITY_SHADERS
+        .get()
+        .is_some_and(|sorted| matches_priority(shaders, sorted))
+}
 
 /// The pools: cheap pipelines, heavy ones ([`heavy`]).
 const CHEAP: usize = 0;
@@ -112,10 +154,12 @@ impl Pending {
         graphics: Option<Box<GraphicsState>>,
         stream: Option<super::record::Stream>,
     ) -> Pending {
+        let priority = is_priority(&shaders);
         Pending {
             key: key(&shaders, graphics.as_deref()),
             shaders,
             graphics,
+            priority,
             queued: AtomicU8::new(IDLE),
             pool: AtomicU8::new(CHEAP as u8),
             made: OnceLock::new(),
@@ -402,10 +446,17 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
     POOLS.ready(p, &FRAME, frame, Budget::get())
 }
 
-/// At the title's creation of a pipeline: starts it at once if an earlier
-/// run drew with it (during loading, so the world's first frames find it).
+/// At the title's creation of a pipeline: starts it at once if it is a
+/// configured priority pipeline (even on a cold cache), or if an earlier run
+/// drew with it (during loading, so the world's first frames find it).
 pub(crate) fn early(p: &Arc<Pending>) {
-    if !p.shaders.is_empty() && super::library::wanted_early(&p.key) {
+    if p.shaders.is_empty() {
+        return;
+    }
+    if p.priority {
+        super::library::EARLY.fetch_add(1, Ordering::Relaxed);
+        POOLS.start(p, PRIORITY);
+    } else if super::library::wanted_early(&p.key) {
         super::library::EARLY.fetch_add(1, Ordering::Relaxed);
         POOLS.start(p, EARLY);
     }
@@ -489,11 +540,11 @@ fn wait_with_cap(p: &Pending, frames: &Frame, frame: u64, budget: Budget, cap_us
     frames.add(kind, waited);
 }
 
-/// One pool's pipelines: first uses first, then those started early. A
-/// pipeline started early and then used is in two queues (of this pool or
-/// of the other); the early entry is passed over once the pipeline is no
-/// longer [`EARLY`].
+/// One pool's pipelines: configured priority pipelines first, then first uses,
+/// then those started early. A pipeline promoted to a higher lane stays in
+/// earlier queues as a stale entry and is passed over once its state advances.
 struct Queues {
+    priority: VecDeque<Arc<Pending>>,
     urgent: VecDeque<Arc<Pending>>,
     early: VecDeque<Arc<Pending>>,
     /// Being made by the pool's workers.
@@ -506,6 +557,7 @@ struct Queues {
 impl Queues {
     const fn new() -> Queues {
         Queues {
+            priority: VecDeque::new(),
             urgent: VecDeque::new(),
             early: VecDeque::new(),
             making: Vec::new(),
@@ -513,37 +565,39 @@ impl Queues {
         }
     }
 
-    /// Queues `p` as `how` ([`EARLY`] or [`URGENT`]) unless it is queued
-    /// that way already, or taken: whether it was not queued before, or
-    /// `None` if nothing changed.
+    /// Queues `p` as `how` ([`EARLY`], [`URGENT`] or [`PRIORITY`]) unless it
+    /// is queued that way already, or taken: whether it was not queued before,
+    /// or `None` if nothing changed.
     fn push(&mut self, p: &Arc<Pending>, how: u8) -> Option<bool> {
         let was = p.queued.load(Ordering::Relaxed);
         if was >= how {
             return None;
         }
         p.queued.store(how, Ordering::Relaxed);
-        if how == URGENT {
-            self.urgent.push_back(p.clone());
-        } else {
-            self.early.push_back(p.clone());
+        match how {
+            PRIORITY => self.priority.push_back(p.clone()),
+            URGENT => self.urgent.push_back(p.clone()),
+            _ => self.early.push_back(p.clone()),
         }
         Some(was == IDLE)
     }
 
     /// The next pipeline to make, taken ([`MAKING`]) and listed as being
-    /// made: the first, first uses then early ones, that would not wait
-    /// for another worker of the pool. Two pipelines of one program would:
-    /// the second worker would wait for the first one's translation, which
-    /// takes up to 38 s for a heavy program ([`waits_for`]). Those passed
-    /// over keep their place.
+    /// made: configured priority pipelines first, then first uses, then early
+    /// ones, skipping any that would wait for another worker of the pool. Two
+    /// pipelines of one program would: the second worker would wait for the
+    /// first one's translation, which takes up to 38 s for a heavy program
+    /// ([`waits_for`]). Those passed over keep their place.
     fn pop(&mut self) -> Option<Arc<Pending>> {
         let Queues {
+            priority,
             urgent,
             early,
             making,
             passed,
         } = self;
-        let p = take(urgent, making, None, passed)
+        let p = take(priority, making, Some(PRIORITY), passed)
+            .or_else(|| take(urgent, making, Some(URGENT), passed))
             .or_else(|| take(early, making, Some(EARLY), passed))?;
         p.queued.store(MAKING, Ordering::Relaxed);
         making.push(p.clone());
@@ -722,7 +776,7 @@ impl Pools {
         budget: Budget,
     ) -> Option<&'a HostPipeline> {
         if p.made.get().is_none() {
-            self.start(p, URGENT);
+            self.start(p, if p.priority { PRIORITY } else { URGENT });
             if !heavy(p) {
                 wait(p, frames, frame, budget);
             }
@@ -1476,5 +1530,122 @@ mod tests {
         // Disabling the cap (u64::MAX) continues waiting in subsequent frames.
         wait_with_cap(&never, &frames, 3, budget, u64::MAX);
         assert!(frames.left(3, 0, budget).is_zero());
+    }
+
+    /// Priority pipelines pop ahead of both bulk first-use (`URGENT`) draws
+    /// and early-started (`EARLY`) pipelines, and promoting a pipeline through
+    /// `EARLY -> URGENT -> PRIORITY` still hands it to workers exactly once.
+    #[test]
+    fn priority_pipelines_jump_ahead_of_urgent_and_early() {
+        let pending = || Arc::new(Pending::new(Vec::new(), None, None));
+        let (early_p, bulk_a, bulk_b, promoted, expo) =
+            (pending(), pending(), pending(), pending(), pending());
+        let mut queues = Queues::new();
+
+        assert_eq!(queues.push(&early_p, EARLY), Some(true));
+        assert_eq!(queues.push(&promoted, EARLY), Some(true));
+        assert_eq!(queues.push(&bulk_a, URGENT), Some(true));
+        assert_eq!(queues.push(&promoted, URGENT), Some(false));
+        assert_eq!(queues.push(&bulk_b, URGENT), Some(true));
+        assert_eq!(queues.push(&expo, PRIORITY), Some(true));
+        assert_eq!(queues.push(&promoted, PRIORITY), Some(false));
+        assert_eq!(queues.push(&promoted, PRIORITY), None);
+        assert_eq!(queues.push(&promoted, URGENT), None);
+        assert_eq!(queues.push(&promoted, EARLY), None);
+
+        // Priority lane drains first in FIFO order, then urgent, then early.
+        assert!(Arc::ptr_eq(&queues.pop().unwrap(), &expo));
+        assert!(Arc::ptr_eq(&queues.pop().unwrap(), &promoted));
+        assert_eq!(promoted.queued.load(Ordering::Relaxed), MAKING);
+        assert_eq!(queues.push(&promoted, PRIORITY), None, "already taken");
+        assert!(Arc::ptr_eq(&queues.pop().unwrap(), &bulk_a));
+        assert!(Arc::ptr_eq(&queues.pop().unwrap(), &bulk_b));
+        assert!(Arc::ptr_eq(&queues.pop().unwrap(), &early_p));
+        assert!(
+            queues.pop().is_none(),
+            "stale early and urgent entries for promoted must be skipped"
+        );
+        assert_eq!(queues.making.len(), 5);
+    }
+
+    /// Hash matching parses exact 16-hex-digit shader hashes (case-insensitive)
+    /// against a sorted priority set and ignores malformed or absent hashes.
+    #[test]
+    fn priority_hash_matching_requires_exact_16_hex_digits() {
+        let shader = |hash: &str| {
+            Arc::new(Shader {
+                stage: "compute",
+                hash: hash.to_owned(),
+                #[cfg(windows)]
+                ambient: None,
+                container: Vec::new(),
+                native: OnceLock::new(),
+                translated: OnceLock::new(),
+            })
+        };
+        let mut sorted = vec![0xfedc_ba98_7654_3210_u64, 0x0123_4567_89ab_cdef_u64];
+        sorted.sort_unstable();
+
+        assert!(matches_priority(&[shader("0123456789abcdef")], &sorted));
+        assert!(matches_priority(&[shader("FEDCBA9876543210")], &sorted));
+        assert!(matches_priority(
+            &[shader("0000000000000001"), shader("0123456789abcdef")],
+            &sorted
+        ));
+        assert!(!matches_priority(&[shader("0000000000000001")], &sorted));
+        assert!(!matches_priority(&[shader("0123456789abcde")], &sorted));
+        assert!(!matches_priority(&[shader("not-a-valid-hash")], &sorted));
+        assert!(!matches_priority(&[shader("0123456789abcdef")], &[]));
+    }
+
+    /// On a single-worker pool held by an in-flight pipeline, a priority
+    /// pipeline queued after a bulk draw is taken and finished before the
+    /// bulk draw once the worker frees up.
+    #[test]
+    fn priority_pipeline_runs_before_queued_bulk_draws_on_worker() {
+        let test =
+            "pipeline::make::tests::priority_pipeline_runs_before_queued_bulk_draws_on_worker";
+        let Some(_gpu) = crate::testgpu::device(test) else {
+            return;
+        };
+        let one = pools([1, 0]);
+        let (blocker_shader, release_blocker) = compute(0, 11, true);
+        let (bulk_shader, release_bulk) = compute(0, 12, true);
+        let (expo_shader, _) = compute(0, 13, false);
+
+        let blocker = Arc::new(Pending::new(vec![blocker_shader], None, None));
+        let bulk = Arc::new(Pending::new(vec![bulk_shader], None, None));
+        let mut expo = Pending::new(vec![expo_shader], None, None);
+        expo.priority = true;
+        let expo = Arc::new(expo);
+
+        // Occupy the lone worker with `blocker`.
+        one.start(&blocker, URGENT);
+        let started = Instant::now();
+        while blocker.queued.load(Ordering::Relaxed) != MAKING
+            && started.elapsed() < Duration::from_secs(5)
+        {
+            std::thread::yield_now();
+        }
+        assert_eq!(blocker.queued.load(Ordering::Relaxed), MAKING);
+
+        // Queue bulk draw first, then the priority compute pipeline.
+        one.start(&bulk, URGENT);
+        let frames = Frame::new();
+        let budget = Budget([Duration::from_secs(30); 2]);
+
+        // Releasing `blocker` lets the worker pick `expo` ahead of `bulk`, so
+        // `expo` completes even while `bulk`'s translation is still held.
+        one.start(&expo, PRIORITY);
+        drop(release_blocker);
+        assert!(
+            one.ready(&expo, &frames, 1, budget).is_some(),
+            "priority pipeline must be made ahead of the held bulk draw"
+        );
+        assert!(!bulk.finished.load(Ordering::Relaxed));
+
+        drop(release_bulk);
+        until_finished(&bulk);
+        assert!(matches!(bulk.made.get(), Some(Some(_))));
     }
 }

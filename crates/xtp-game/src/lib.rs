@@ -7,6 +7,7 @@
 pub mod ambient;
 pub mod asserts;
 pub mod intro;
+pub mod priority_pipelines;
 pub mod rpf;
 pub mod rt_path;
 pub mod sgd5;

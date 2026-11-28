@@ -862,6 +862,8 @@ mod library;
 #[cfg(windows)]
 mod make;
 #[cfg(windows)]
+pub use make::configure_priority_pipelines;
+#[cfg(windows)]
 pub mod precook;
 #[cfg(windows)]
 mod record;
