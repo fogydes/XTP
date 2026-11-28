@@ -1274,7 +1274,10 @@ unsafe fn triangles(
             DXGI_FORMAT_R32G32B32_FLOAT => (12, 4),
             // Quantized, read a word at a time.
             DXGI_FORMAT_R32G32_FLOAT => (console::QUANTIZED_VERTEX, 4),
-            DXGI_FORMAT_R16G16B16A16_FLOAT | DXGI_FORMAT_R16G16B16A16_SNORM => (8, 2),
+            // DXR ignores A16; XYZ may be packed at a six-byte stride and
+            // the final vertex need not have a fourth component.
+            // https://learn.microsoft.com/windows/win32/api/d3d12/ns-d3d12-d3d12_raytracing_geometry_triangles_desc
+            DXGI_FORMAT_R16G16B16A16_FLOAT | DXGI_FORMAT_R16G16B16A16_SNORM => (6, 2),
             DXGI_FORMAT_R16G16_FLOAT | DXGI_FORMAT_R16G16_SNORM => (4, 2),
             format => return invalid(i, format_args!("vertex format {}", format.0)),
         };

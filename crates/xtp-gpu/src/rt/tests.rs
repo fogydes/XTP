@@ -1153,6 +1153,106 @@ fn rt_invalid_blas_inputs_are_refused_before_their_build() {
     assert!(translate(&unindexed), "three vertices without indices");
 }
 
+/// DXR ignores A16 in four-component half formats. Packed XYZ, including
+/// a final vertex without A16, must still build a BLAS that rays can hit.
+#[test]
+fn rt_packed_half_vertices_build_their_triangle() {
+    let test = "rt_packed_half_vertices_build_their_triangle";
+    let Some((gpu, rays)) = dxr(test) else {
+        return;
+    };
+    let code = rays.then(|| ray_program(&[]));
+    for (format, positive, negative) in [
+        (DXGI_FORMAT_R16G16B16A16_FLOAT, 0x3c00u16, 0xbc00u16),
+        (DXGI_FORMAT_R16G16B16A16_SNORM, 0x7fffu16, 0x8001u16),
+    ] {
+        for (stride, skew) in [(6usize, 0usize), (6, 2), (8, 0), (8, 2)] {
+            // Exactly XYZ through the last vertex; no fourth component.
+            let vertices = TitleBuffer::new(skew + 2 * stride + 6);
+            for (v, xyz) in [
+                [negative, negative, 0],
+                [0, positive, 0],
+                [positive, negative, 0],
+            ]
+            .iter()
+            .enumerate()
+            {
+                for (component, &value) in xyz.iter().enumerate() {
+                    // SAFETY: each component lies in this test's vertex buffer.
+                    unsafe {
+                        (vertices.address() as *mut u8)
+                            .add(skew + v * stride + component * 2)
+                            .cast::<u16>()
+                            .write_unaligned(value);
+                    }
+                }
+            }
+            let geometry = Geometry {
+                Type: D3D12_RAYTRACING_GEOMETRY_TYPE_TRIANGLES,
+                Flags: D3D12_RAYTRACING_GEOMETRY_FLAG_OPAQUE,
+                Anonymous: D3D12_RAYTRACING_GEOMETRY_DESC_0 {
+                    Triangles: D3D12_RAYTRACING_GEOMETRY_TRIANGLES_DESC {
+                        VertexFormat: format,
+                        VertexCount: 3,
+                        VertexBuffer: D3D12_GPU_VIRTUAL_ADDRESS_AND_STRIDE {
+                            StartAddress: vertices.address() + skew as u64,
+                            StrideInBytes: stride as u64,
+                        },
+                        ..Default::default()
+                    },
+                },
+            };
+            let list = TitleList::new();
+            // Negative controls: short stride, misalignment, truncated range.
+            for (offset, bad_stride) in [(0, 4), (1, stride), (2, stride)] {
+                let mut bad = geometry;
+                // SAFETY: this copy was initialized as a triangle description.
+                unsafe { bad.Anonymous.Triangles.VertexBuffer.StartAddress += offset };
+                bad.Anonymous.Triangles.VertexBuffer.StrideInBytes = bad_stride as u64;
+                // SAFETY: the descriptor is ours; translation checks its input ranges.
+                assert!(unsafe { triangles(list.host(), &blas_input(&bad)) }.is_none());
+            }
+            let (blas, tlas) = (TitleBuffer::new(1024), TitleBuffer::new(1024));
+            let instances = instances_of(&[blas.address()]);
+            // SAFETY: the descriptors and their title buffers outlive execution.
+            unsafe {
+                assert!(
+                    Builder.build(
+                        list.this(),
+                        &Build {
+                            DestAccelerationStructureData: blas.address(),
+                            Inputs: blas_input(&geometry),
+                            ..Default::default()
+                        }
+                    ),
+                    "format {format:?}, stride {stride}, skew {skew}"
+                );
+                assert!(Builder.build(list.this(), &tlas_desc(tlas.address(), &instances)));
+            }
+            let out = unwritten();
+            if let Some(code) = &code {
+                let descriptor = Descriptor::new(tlas.address());
+                trace_program(
+                    gpu.host(),
+                    &list,
+                    Scene::Descriptor(descriptor.handle()),
+                    &out,
+                    code,
+                );
+            }
+            list.run();
+            assert!(registry().structures.contains_key(&blas.address()));
+            if rays {
+                assert_eq!(
+                    out.words(),
+                    hit(),
+                    "format {format:?}, stride {stride}, skew {skew}"
+                );
+            }
+        }
+    }
+}
+
 thread_local! {
     /// Set by a test to refuse the title's structures on its own thread,
     /// as `XTP_RT_BUILDS=0` does for a whole run ([`builds_on`]).
