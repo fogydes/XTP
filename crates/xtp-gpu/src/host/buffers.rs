@@ -380,6 +380,7 @@ impl Drop for RtReservation {
 
 /// Scratch and instance buffers use on-demand heaps separate from title
 /// shadows. Releasing the last placed resource returns the heap's budget.
+#[track_caller]
 pub(crate) fn rt_buffer(
     device: &ID3D12Device,
     size: u64,
@@ -413,6 +414,7 @@ pub(crate) fn rt_buffer(
 /// A buffer of `size` bytes of `kind`, mapped (but a [`Kind::Card`] one,
 /// which the CPU cannot map: its pointer is null), placed in a pool's
 /// heap; `None` without pools (the caller makes a committed one).
+#[track_caller]
 pub(crate) fn buffer(kind: Kind, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
     let pool = match kind {
         Kind::Card => card_pool(&CARDS.get()?.device)?,
@@ -424,6 +426,7 @@ pub(crate) fn buffer(kind: Kind, size: u64) -> Option<(ID3D12Resource, *mut u8)>
 /// A buffer of `size` bytes in the card's memory ([`Kind::Card`]): placed
 /// in the card's pool when it runs, else committed (made on this thread).
 /// `None` if it cannot be made.
+#[track_caller]
 pub(crate) fn card_buffer(device: &ID3D12Device, size: u64) -> Option<ID3D12Resource> {
     if let Some((buffer, _)) = buffer(Kind::Card, size) {
         return Some(buffer);
@@ -484,13 +487,20 @@ pub(crate) fn summary() -> Option<String> {
             let (reserved, free) = (s.reserved(), s.free());
             let waits = p.waited[1].swap(0, Ordering::Relaxed);
             let us = p.waited[0].swap(0, Ordering::Relaxed);
+            let heaps = s.heaps.len();
+            drop(s);
+            let callers = by_caller(p.kind, 6);
+            let callers = if callers.is_empty() {
+                String::new()
+            } else {
+                format!(" (by caller: {callers})")
+            };
             format!(
-                "{:?} {} heaps {} MiB, {} MiB used, {waits} waits {:.1} ms",
+                "{:?} {heaps} heaps {} MiB, {} MiB used, {waits} waits {:.1} ms{callers}",
                 p.kind,
-                s.heaps.len(),
                 reserved >> 20,
                 (reserved - free) >> 20,
-                us as f64 / 1e3
+                us as f64 / 1e3,
             )
         })
         .collect();
@@ -667,6 +677,7 @@ impl Pool {
         self.changed.notify_all();
     }
 
+    #[track_caller]
     fn place(&'static self, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
         let state = if self.kind == Kind::Upload {
             D3D12_RESOURCE_STATE_GENERIC_READ
@@ -676,6 +687,7 @@ impl Pool {
         self.place_in_state(size, state)
     }
 
+    #[track_caller]
     fn place_in_state(
         &'static self,
         size: u64,
@@ -688,6 +700,7 @@ impl Pool {
         self.place_room(room, len, size, state)
     }
 
+    #[track_caller]
     fn place_room(
         &'static self,
         room: Room,
@@ -695,6 +708,7 @@ impl Pool {
         size: u64,
         state: D3D12_RESOURCE_STATES,
     ) -> Option<(ID3D12Resource, *mut u8)> {
+        let site = std::panic::Location::caller();
         let Room {
             heap,
             id,
@@ -735,7 +749,7 @@ impl Pool {
                     if self.kind != Kind::Card {
                         b.Map(0, None, Some(&mut data))?;
                     }
-                    let lease = Lease::interface(self, id, offset, len);
+                    let lease = Lease::interface(self, id, offset, len, site);
                     lease_created = true;
                     b.SetPrivateDataInterface(&LEASE, &lease)
                 })
@@ -779,6 +793,51 @@ fn has_lease(resource: &ID3D12Resource) -> bool {
     unsafe { resource.GetPrivateData(&LEASE, &mut size, None) }.is_ok()
 }
 
+/// Placed bytes alive, by pool and by the line of XTP that asked for them:
+/// buffers alive and their bytes (placement units). Counted as leases are
+/// made and released; it changes nothing of either.
+type Held = std::collections::HashMap<(usize, &'static str, u32), (u64, u64)>;
+static HELD: Mutex<Option<Held>> = Mutex::new(None);
+
+/// Counts `len` bytes of pool `kind` asked for at `site` as made (`made`)
+/// or given back. Takes its own lock only, never a pool's.
+fn held(kind: Kind, site: &'static std::panic::Location<'static>, len: u64, made: bool) {
+    let mut held = HELD.lock().unwrap_or_else(|e| e.into_inner());
+    let entry = held
+        .get_or_insert_with(Default::default)
+        .entry((kind as usize, site.file(), site.line()))
+        .or_default();
+    if made {
+        entry.0 += 1;
+        entry.1 += len;
+    } else {
+        entry.0 = entry.0.saturating_sub(1);
+        entry.1 = entry.1.saturating_sub(len);
+    }
+}
+
+/// The lines holding the most placed bytes of pool `kind`, at most
+/// `top` of them with 16 MiB or more: `file:line MiB in buffers`.
+pub(crate) fn by_caller(kind: Kind, top: usize) -> String {
+    let held = HELD.lock().unwrap_or_else(|e| e.into_inner());
+    let mut rows: Vec<(&'static str, u32, u64, u64)> = held
+        .iter()
+        .flatten()
+        .filter(|((k, _, _), (_, bytes))| *k == kind as usize && *bytes >= 16 << 20)
+        .map(|((_, file, line), (n, bytes))| (*file, *line, *n, *bytes))
+        .collect();
+    drop(held);
+    rows.sort_by_key(|row| std::cmp::Reverse(row.3));
+    rows.iter()
+        .take(top)
+        .map(|(file, line, n, bytes)| {
+            let name = file.rsplit(['/', '\\']).next().unwrap_or(file);
+            format!("{name}:{line} {} MiB in {n}", bytes >> 20)
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 /// A placed buffer's range in its heap: a COM object (`IUnknown` alone)
 /// that the resource holds as private data, which D3D12 releases with the
 /// resource. Its last release gives the range back.
@@ -791,6 +850,8 @@ struct Lease {
     heap: u64,
     offset: u64,
     len: u64,
+    /// Where the buffer was asked for ([`by_caller`]).
+    site: &'static std::panic::Location<'static>,
 }
 
 static LEASE_VTABLE: IUnknown_Vtbl = IUnknown_Vtbl {
@@ -801,7 +862,14 @@ static LEASE_VTABLE: IUnknown_Vtbl = IUnknown_Vtbl {
 
 impl Lease {
     /// A new lease, as the interface that holds its one reference.
-    fn interface(pool: &'static Pool, heap: u64, offset: u64, len: u64) -> IUnknown {
+    fn interface(
+        pool: &'static Pool,
+        heap: u64,
+        offset: u64,
+        len: u64,
+        site: &'static std::panic::Location<'static>,
+    ) -> IUnknown {
+        held(pool.kind, site, len, true);
         let lease = Box::into_raw(Box::new(Lease {
             vtable: &LEASE_VTABLE,
             refs: std::sync::atomic::AtomicU32::new(1),
@@ -809,6 +877,7 @@ impl Lease {
             heap,
             offset,
             len,
+            site,
         }));
         // SAFETY: a COM object of ours with one reference, which the
         // interface takes over.
@@ -853,6 +922,7 @@ unsafe extern "system" fn lease_release(this: *mut std::ffi::c_void) -> u32 {
         std::sync::atomic::fence(Ordering::Acquire);
         // SAFETY: the last reference: the box made in `Lease::new`.
         let lease = unsafe { Box::from_raw(lease) };
+        held(lease.pool.kind, lease.site, lease.len, false);
         lease.pool.give(lease.heap, lease.offset, lease.len);
     }
     left
@@ -880,6 +950,22 @@ fn before_placing(size: u64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The bytes a line holds are counted up as leases are made and down as
+    /// they go, and only lines with 16 MiB or more are named.
+    #[test]
+    fn placed_bytes_are_counted_by_the_line_that_asked() {
+        let site = std::panic::Location::caller();
+        let line = format!("buffers.rs:{} ", site.line());
+        held(Kind::Card, site, 40 << 20, true);
+        held(Kind::Card, site, 24 << 20, true);
+        assert!(by_caller(Kind::Card, 6).contains(&format!("{line}64 MiB in 2")));
+        assert!(!by_caller(Kind::Upload, 6).contains(&line));
+        held(Kind::Card, site, 40 << 20, false);
+        assert!(by_caller(Kind::Card, 6).contains(&format!("{line}24 MiB in 1")));
+        held(Kind::Card, site, 24 << 20, false);
+        assert!(!by_caller(Kind::Card, 6).contains(&line));
+    }
 
     #[test]
     fn ranges_take_the_best_fit_and_merge_what_comes_back() {

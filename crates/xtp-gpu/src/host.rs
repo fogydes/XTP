@@ -1099,6 +1099,52 @@ static SPARE_SCRATCH: Mutex<Vec<(ID3D12Resource, usize, u64)>> = Mutex::new(Vec:
 /// Spares kept of each kind at most.
 const SPARES: usize = 256;
 
+/// Recordings of lists ended (by a reset) since the last memory line, by the
+/// scratch memory they used: up to 256 KiB, 1 MiB, 4 MiB, past 4 MiB; then
+/// the chunks those lists held and the bytes they used.
+static SCRATCH_USE: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
+/// Scratch allocations larger than a chunk since the last memory line, each
+/// in a buffer of its own: how many, and their bytes.
+static SCRATCH_OWN: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+/// Counts the scratch memory of a recording that ends ([`SCRATCH_USE`]).
+fn note_scratch_use(s: &Scratch) {
+    let used = if s.chunks.is_empty() {
+        0
+    } else {
+        s.current as u64 * SCRATCH_CHUNK + s.used
+    };
+    let class = match used {
+        0..=0x4_0000 => 0,
+        0x4_0001..=0x10_0000 => 1,
+        0x10_0001..=0x40_0000 => 2,
+        _ => 3,
+    };
+    SCRATCH_USE[class].fetch_add(1, Ordering::Relaxed);
+    SCRATCH_USE[4].fetch_add(s.chunks.len() as u64, Ordering::Relaxed);
+    SCRATCH_USE[5].fetch_add(used, Ordering::Relaxed);
+}
+
+/// [`SCRATCH_USE`] since the last call, for the memory line.
+fn scratch_use() -> String {
+    let [small, mid, chunk, big, held, used] =
+        SCRATCH_USE.each_ref().map(|n| n.swap(0, Ordering::Relaxed));
+    let [own, own_bytes] = SCRATCH_OWN.each_ref().map(|n| n.swap(0, Ordering::Relaxed));
+    let ended = small + mid + chunk + big;
+    format!(
+        "{ended} list recordings ended ({small} used up to 256 KiB of scratch, {mid} up to 1 MiB, \
+         {chunk} up to 4 MiB, {big} more), holding {held} chunks for {} MiB used; \
+         {own} allocations larger than a chunk in buffers of their own ({} KiB)",
+        used >> 20,
+        own_bytes >> 10
+    )
+}
+
+/// The spare scratch chunks held now (for the memory line).
+fn spare_scratch_chunks() -> usize {
+    pool(&SPARE_SCRATCH).len()
+}
+
 fn pool<T>(spares: &'static Mutex<Vec<T>>) -> std::sync::MutexGuard<'static, Vec<T>> {
     spares.lock().unwrap_or_else(|e| e.into_inner())
 }
@@ -2569,6 +2615,7 @@ impl HostList {
         if self.ours.load(Ordering::Acquire) && self.running() {
             self.settle();
         }
+        note_scratch_use(&self.scratch.lock().unwrap_or_else(|e| e.into_inner()));
         let running = if self.running() { made() } else { None };
         let allocator = {
             let mut allocator = self.allocator.lock().unwrap_or_else(|e| e.into_inner());
@@ -3083,6 +3130,7 @@ impl HostList {
     /// reset.
     ///
     /// shortcut: one buffer per copy; pool them once uploads are frequent.
+    #[track_caller]
     pub(crate) fn upload(&self, host: &Host, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
         let (buffer, data) = host.upload_buffer(size)?;
         name(&buffer, || format!("list upload {size:#x}"));
@@ -3109,6 +3157,8 @@ impl HostList {
         let host = host()?;
         let len = len.max(1).next_multiple_of(256);
         if len > SCRATCH_CHUNK {
+            SCRATCH_OWN[0].fetch_add(1, Ordering::Relaxed);
+            SCRATCH_OWN[1].fetch_add(len, Ordering::Relaxed);
             let (buffer, data) = host.upload_buffer(len)?;
             name(&buffer, || format!("list scratch {len:#x}"));
             // SAFETY: a live buffer.
@@ -3721,6 +3771,63 @@ pub(crate) fn write_mapped(dst: *mut u8, src: *const u8, len: usize) {
     });
 }
 
+/// For the frame-rate line: the video memory the adapter gives this
+/// process and what it uses, local (the card) and non-local (system memory
+/// the adapter maps), and the process's own memory and page faults since
+/// the last line. It changes nothing.
+fn log_memory(device: &ID3D12Device) {
+    let mib = |b: u64| b >> 20;
+    let (lb, lu) = crate::dxgi::video_memory(device).unwrap_or_default();
+    let (nb, nu) = crate::dxgi::non_local_memory(device).unwrap_or_default();
+    let (ws, private, faults) = process_memory().unwrap_or_default();
+    static FAULTS: AtomicU64 = AtomicU64::new(0);
+    let new_faults = faults.saturating_sub(FAULTS.swap(faults, Ordering::Relaxed));
+    tracing::info!(
+        "memory: card {} of {} MiB, system for the GPU {} of {} MiB; process working set {} MiB, \
+         private {} MiB, {new_faults} page faults since the last line; snapshot mirrors {} MiB \
+         ({} MiB of pages written); \
+         {} spare list scratch chunks",
+        mib(lu),
+        mib(lb),
+        mib(nu),
+        mib(nb),
+        mib(ws),
+        mib(private),
+        mib(crate::shadow::MIRRORS.load(Ordering::Relaxed)),
+        mib(crate::shadow::MIRRORS_WRITTEN.load(Ordering::Relaxed)),
+        spare_scratch_chunks(),
+    );
+    tracing::info!("list scratch: {}", scratch_use());
+    tracing::info!("title memory windows: {}", crate::shadow::loose_use());
+}
+
+/// This process's working set, private bytes and page faults so far.
+fn process_memory() -> Option<(u64, u64, u64)> {
+    use windows_sys::Win32::System::ProcessStatus::{
+        GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS, PROCESS_MEMORY_COUNTERS_EX,
+    };
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    let mut c = PROCESS_MEMORY_COUNTERS_EX {
+        cb: std::mem::size_of::<PROCESS_MEMORY_COUNTERS_EX>() as u32,
+        ..Default::default()
+    };
+    // SAFETY: our own process; the structure is ours and sized as it says.
+    let ok = unsafe {
+        GetProcessMemoryInfo(
+            GetCurrentProcess(),
+            (&raw mut c).cast::<PROCESS_MEMORY_COUNTERS>(),
+            c.cb,
+        )
+    };
+    (ok != 0).then(|| {
+        (
+            c.WorkingSetSize as u64,
+            c.PrivateUsage as u64,
+            u64::from(c.PageFaultCount),
+        )
+    })
+}
+
 /// Calls `f` with the pieces of `[start, start + len)` cut at multiples of
 /// `step`.
 fn for_pieces(start: usize, len: usize, step: usize, mut f: impl FnMut(usize, usize)) {
@@ -3736,6 +3843,7 @@ fn for_pieces(start: usize, len: usize, step: usize, mut f: impl FnMut(usize, us
 impl Host {
     /// A buffer in the upload heap, mapped for writing: placed in a heap
     /// reserved ahead ([`buffers`]), else committed.
+    #[track_caller]
     pub(crate) fn upload_buffer(&self, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
         if let Some(placed) = buffers::buffer(buffers::Kind::Upload, size) {
             return Some(placed);
@@ -4019,6 +4127,9 @@ impl Meter {
             if let Some(pools) = buffers::summary() {
                 tracing::info!("buffer heaps: {pools}");
             }
+            if let Some(host) = host() {
+                log_memory(&host.device);
+            }
             #[cfg(feature = "diagnostics")]
             {
                 crate::copystat::log(std::mem::take(&mut self.copy_stats_frames) as f64);
@@ -4294,6 +4405,7 @@ impl Host {
     /// memory that shaders write, which upload memory cannot be. Starts in
     /// the common state (buffers move out of it implicitly), zeroed. Placed
     /// in a heap reserved ahead ([`buffers`]), else committed.
+    #[track_caller]
     pub(crate) fn shared_buffer(&self, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
         if let Some(placed) = buffers::buffer(buffers::Kind::System, size) {
             return Some(placed);

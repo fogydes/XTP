@@ -154,6 +154,18 @@ pub(crate) fn host_adapter() -> Option<IUnknown> {
 /// budget, making a resource resident can wait in the kernel for memory.
 /// `None` if DXGI cannot tell.
 pub(crate) fn video_memory(device: &ID3D12Device) -> Option<(u64, u64)> {
+    video_memory_in(device, DXGI_MEMORY_SEGMENT_GROUP_LOCAL)
+}
+
+/// As [`video_memory`], for the non-local segment: the system memory the
+/// adapter maps for this process (upload and readback heaps, custom heaps
+/// in system memory, and card memory the driver moved out).
+pub(crate) fn non_local_memory(device: &ID3D12Device) -> Option<(u64, u64)> {
+    video_memory_in(device, DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL)
+}
+
+/// [`video_memory`] for segment group `group`.
+fn video_memory_in(device: &ID3D12Device, group: DXGI_MEMORY_SEGMENT_GROUP) -> Option<(u64, u64)> {
     /// The adapter, asked once.
     struct Found(Option<IDXGIAdapter3>);
     // SAFETY: DXGI adapters are free-threaded; this one is only queried.
@@ -176,7 +188,7 @@ pub(crate) fn video_memory(device: &ID3D12Device) -> Option<(u64, u64)> {
         adapter
             .0
             .as_ref()?
-            .QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &mut info)
+            .QueryVideoMemoryInfo(0, group, &mut info)
             .ok()?;
     }
     Some((info.Budget, info.CurrentUsage))
