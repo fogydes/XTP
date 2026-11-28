@@ -2118,3 +2118,25 @@ fn rt_a_trace_by_its_host_list_takes_the_tlas_submitted_before_it() {
     tracing.run();
     assert_eq!(out.words(), hit(), "the TLAS submitted before the trace");
 }
+
+#[test]
+fn rt_trace_signatures_reuse_the_same_root_parameter_and_stride() {
+    let test = "rt_trace_signatures_reuse_the_same_root_parameter_and_stride";
+    let Some((gpu, _)) = dxr(test) else {
+        return;
+    };
+    let (root, _) = instances::compute_pass(
+        device(gpu.host()).unwrap(),
+        br#"[RootSignature("SRV(t0), SRV(t1)")]
+            [numthreads(1,1,1)] void main() {}"#,
+        windows::core::s!("signature_test"),
+    )
+    .unwrap();
+    let first = dispatch::signature(&root, 0, 20).unwrap();
+    let same = dispatch::signature(&root, 0, 20).unwrap();
+    assert_eq!(first.as_raw(), same.as_raw(), "reuse the driver object");
+    let other_param = dispatch::signature(&root, 1, 20).unwrap();
+    let other_stride = dispatch::signature(&root, 0, 24).unwrap();
+    assert_ne!(first.as_raw(), other_param.as_raw());
+    assert_ne!(first.as_raw(), other_stride.as_raw());
+}
