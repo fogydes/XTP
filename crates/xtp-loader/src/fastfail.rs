@@ -675,7 +675,11 @@ mod tests {
                 "--exact",
                 &format!("fastfail::tests::{child}"),
                 "--nocapture",
+                // With one test thread the pretty formatter prefixes the
+                // child's `expect` line with its test name. Keep it separate.
+                "--quiet",
             ])
+            .env("RUST_TEST_THREADS", "1")
             .env("XTP_FASTFAIL_LOG", &log)
             .output()
             .unwrap();
