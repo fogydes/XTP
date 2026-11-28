@@ -6,6 +6,7 @@
 #[cfg(windows)]
 pub mod ambient;
 pub mod asserts;
+pub mod bake_textures;
 pub mod intro;
 pub mod priority_pipelines;
 pub mod rpf;

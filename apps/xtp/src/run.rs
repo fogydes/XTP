@@ -177,6 +177,7 @@ pub fn run(
     if execute && xtp_game::identify(&hash).is_some() {
         xtp_game::water_tile_slots::configure();
         xtp_game::priority_pipelines::configure();
+        xtp_game::bake_textures::configure(&hash);
         xtp_gpu::configure_copy_back(
             cfg.cache_subdir("readmap")
                 .ok()
