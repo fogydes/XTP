@@ -3,7 +3,7 @@
 //!
 //! This is an allowlist, not a blocklist: a file passes only if its name is
 //! on the list, it is not too big, it is text, and it does not smuggle data
-//! inside text (long hex/base64 runs).
+//! inside text (long hex/base64 runs or decimal byte arrays).
 
 use std::path::Path;
 use std::process::Command;
@@ -12,6 +12,8 @@ use anyhow::{Context, Result, bail};
 
 const MAX_FILE_SIZE: usize = 512 * 1024;
 const MAX_ENCODED_RUN: usize = 512;
+// The XMA decoder has a 272-entry decimal VLC table.
+const MAX_DECIMAL_BYTES: usize = 512;
 
 const ALLOWED_EXTENSIONS: &[&str] = &[
     "rs", "toml", "md", "txt", "lock", "yml", "yaml", "json", "hlsl", "hlsli", "ps1", "cmd", "sh",
@@ -216,10 +218,18 @@ pub fn check(path: &str, content: &[u8]) -> Vec<String> {
     }
     if content.contains(&0) {
         problems.push("binary content (NUL bytes)".to_owned());
-    } else if let Some(run) = longest_encoded_run(content)
-        && run > MAX_ENCODED_RUN
-    {
-        problems.push(format!("{run}-character hex/base64 run (embedded data?)"));
+    } else {
+        if let Some(run) = longest_encoded_run(content)
+            && run > MAX_ENCODED_RUN
+        {
+            problems.push(format!("{run}-character hex/base64 run (embedded data?)"));
+        }
+        let decimal_bytes = longest_decimal_byte_array(content);
+        if decimal_bytes > MAX_DECIMAL_BYTES {
+            problems.push(format!(
+                "{decimal_bytes} decimal bytes in one array (embedded data?)"
+            ));
+        }
     }
     if !content.contains(&0) {
         let text = String::from_utf8_lossy(content).to_lowercase();
@@ -251,9 +261,38 @@ fn longest_encoded_run(content: &[u8]) -> Option<usize> {
     content.split(|b| !is_payload(b)).map(<[u8]>::len).max()
 }
 
+/// Recognize bracketed, comma-separated decimal bytes in source or JSON.
+fn longest_decimal_byte_array(content: &[u8]) -> usize {
+    content
+        .split(|&byte| byte == b'[')
+        .skip(1)
+        .filter_map(|tail| {
+            let close = tail.iter().position(|&byte| byte == b']')?;
+            let array = tail[..close].trim_ascii();
+            let values = array.strip_suffix(b",").unwrap_or(array);
+            let mut count = 0;
+            for value in values.split(|&byte| byte == b',') {
+                let value = value.trim_ascii();
+                let digits = value
+                    .strip_suffix(b"_u8")
+                    .or_else(|| value.strip_suffix(b"u8"))
+                    .unwrap_or(value);
+                if !digits.iter().all(u8::is_ascii_digit)
+                    || std::str::from_utf8(digits).ok()?.parse::<u8>().is_err()
+                {
+                    return None;
+                }
+                count += 1;
+            }
+            Some(count)
+        })
+        .max()
+        .unwrap_or(0)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::check;
+    use super::{MAX_DECIMAL_BYTES, check};
 
     /// Enforces the policy wherever tests run, even in clones without the hook.
     #[test]
@@ -353,5 +392,26 @@ mod tests {
     fn rejects_data_smuggled_into_text() {
         let blob = format!("const DATA: &str = \"{}\";", "A1".repeat(400));
         assert!(!check("src/blob.rs", blob.as_bytes()).is_empty());
+    }
+
+    #[test]
+    fn rejects_data_smuggled_as_a_decimal_byte_array() {
+        let values: Vec<String> = (0..=MAX_DECIMAL_BYTES)
+            .map(|i| ((i * 73 + 17) % 256).to_string())
+            .collect();
+        let short = format!("[{}]", values[..MAX_DECIMAL_BYTES].join(", "));
+        assert!(check("table.json", short.as_bytes()).is_empty());
+
+        let data = format!("const DATA: &[u8] = &[{}u8,\n];\n", values.join("_u8, "));
+        assert_eq!(
+            check("src/data.rs", data.as_bytes()),
+            [format!(
+                "{} decimal bytes in one array (embedded data?)",
+                values.len()
+            )]
+        );
+
+        let statement = format!("[{}]; [0, 1]", values[..MAX_DECIMAL_BYTES].join(", "));
+        assert!(check("src/table.rs", statement.as_bytes()).is_empty());
     }
 }
