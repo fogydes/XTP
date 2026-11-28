@@ -1266,7 +1266,18 @@ impl Listing {
     /// only what changed since (none if nothing did), or every run again
     /// after a step that wrote title memory. Runs are declared written once
     /// per submission, and those that changed since.
+    #[cfg(test)]
     fn due(&mut self, submission: u64, written: u64, writing: bool) -> (Vec<Span>, Vec<Span>) {
+        self.due_within(submission, written, None, writing)
+    }
+
+    fn due_within(
+        &mut self,
+        submission: u64,
+        written: u64,
+        write_ranges: Option<&[(usize, usize)]>,
+        writing: bool,
+    ) -> (Vec<Span>, Vec<Span>) {
         let mut due = std::mem::take(&mut self.due);
         if due.submission != submission {
             due.submission = submission;
@@ -1275,13 +1286,35 @@ impl Listing {
             due.given_reads.clear();
             due.given_writes.clear();
         }
-        let all = !due.current || due.written != written;
+        let written_changed = due.written != written;
+        let all = !due.current || (written_changed && write_ranges.is_none());
         let mut reads = Vec::new();
         Due::catch_up(self, &mut due.reads, due.seen, false, all, &mut reads);
         due.seen = self.changes;
         if all {
             reads = Due::every(&due.reads);
             (due.current, due.written) = (true, written);
+        } else if written_changed && let Some(ranges) = write_ranges {
+            let from_idx = usize::try_from(due.written)
+                .unwrap_or(ranges.len())
+                .min(ranges.len());
+            let new_writes = &ranges[from_idx..];
+            if new_writes.iter().any(|&(a, b)| a < b) {
+                for (copy, runs) in due.reads.values() {
+                    for (&from, &to) in runs {
+                        let (a, b) = (from as usize, to as usize);
+                        let touched = new_writes.iter().any(|&(wa, wb)| wa < b && wb > a);
+                        if touched
+                            && !reads
+                                .iter()
+                                .any(|(c, rf, rt)| Arc::ptr_eq(c, copy) && *rf == from && *rt == to)
+                        {
+                            reads.push((copy.clone(), from, to));
+                        }
+                    }
+                }
+            }
+            due.written = written;
         }
         let mut writes = Vec::new();
         if writing {
@@ -1408,9 +1441,35 @@ impl PickedStep {
     /// At the step's run in `submission`, after `written` steps of its
     /// preparation that wrote title memory: the runs to refresh and those
     /// to declare written ([`Listing::due`]).
+    #[cfg(test)]
     pub(crate) fn due(&self, submission: u64, written: u64) -> (Vec<Span>, Vec<Span>) {
+        self.record_due(self.picked.listing().due(
+            submission,
+            written,
+            self.writes.load(Ordering::Relaxed),
+        ))
+    }
+
+    /// At the step's run in `submission`, given the title ranges written by
+    /// earlier preparation steps in that submission: refreshes only runs
+    /// that overlap one of those writes once the submission's full set was
+    /// already given.
+    pub(crate) fn due_ranges(
+        &self,
+        submission: u64,
+        title_write_ranges: &[(usize, usize)],
+    ) -> (Vec<Span>, Vec<Span>) {
         let writing = self.writes.load(Ordering::Relaxed);
-        let (reads, writes) = self.picked.listing().due(submission, written, writing);
+        let written = title_write_ranges.len() as u64;
+        self.record_due(self.picked.listing().due_within(
+            submission,
+            written,
+            Some(title_write_ranges),
+            writing,
+        ))
+    }
+
+    fn record_due(&self, (reads, writes): (Vec<Span>, Vec<Span>)) -> (Vec<Span>, Vec<Span>) {
         let bytes: u64 = reads.iter().map(|(_, from, to)| to - from).sum();
         for (counter, n) in [
             (0, reads.len() as u64),
@@ -8050,6 +8109,50 @@ void main() {
         assert_eq!(runs, want, "the N runs, by address");
         assert!(writes.is_empty(), "no shader writes through them");
         assert_eq!(heap.visits(), 1, "the copy looked at once");
+        RUN_TIME_VIEWS_TEST.set(None);
+    }
+
+    #[test]
+    fn title_writes_outside_picked_runs_do_not_re_emit_disjoint_runs() {
+        use crate::testgpu::{TitleBuffer, TitleList};
+        let test = "descriptor::host::tests::title_writes_outside_picked_runs_do_not_re_emit_disjoint_runs";
+        let Some(_gpu) = crate::testgpu::device(test) else {
+            return;
+        };
+        RUN_TIME_VIEWS_TEST.set(Some(true));
+        let heap = HostHeap::new_with(false, 16, true).expect("a host view heap");
+        let apart = 2 * RUN_GAP as usize;
+        let buffer = TitleBuffer::new(2 * apart);
+        let slots = vec![0u64; 16 * 4];
+        let at = |i: usize| slots.as_ptr() as u64 + 32 * i as u64;
+        let list = TitleList::new();
+        let l = list.host();
+        let mut used = PickedUse::default();
+        for i in 0..2 {
+            let first = (i * apart / 16) as u32;
+            let View::Shader(r, Some(words)) =
+                buffer_view(false, &buffer, structured(16), (first, 16))
+            else {
+                unreachable!()
+            };
+            let r = r as crate::object::This;
+            crate::descriptor::create_srv(std::ptr::null(), r, &words, at(i));
+            heap.mirror(i as u32, at(i), false);
+            let picked = heap.picked_spans(at(0)).expect("a listing");
+            used.defer(l, &picked, false);
+        }
+        let step = used.step.as_ref().map(|(_, s)| s.clone()).expect("a step");
+        let sub = crate::shadow::submission();
+        let base = buffer.address() as usize;
+        assert_eq!(step.due_ranges(sub, &[]).0.len(), 2);
+        // A write strictly between the two runs refreshes neither.
+        let untouched = [(base + 512, base + 576)];
+        assert_eq!(step.due_ranges(sub, &untouched).0.len(), 0);
+        // A write overlapping run 1 re-emits only run 1.
+        let hit = [untouched[0], (base + apart, base + apart + 64)];
+        let (reads, _) = step.due_ranges(sub, &hit);
+        assert_eq!(reads.len(), 1);
+        assert_eq!(reads[0].1, (base + apart) as u64);
         RUN_TIME_VIEWS_TEST.set(None);
     }
 

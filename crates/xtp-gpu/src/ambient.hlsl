@@ -2,7 +2,7 @@
 // Adapted from the ambient passes of a VIctory fork; the cut reset follows
 // edsuuu/VI-BR-PORT@370700b6 and the floor follows crbns/victory-tapin@a08708c3.
 
-#define RS "RootConstants(num32BitConstants=14, b0), DescriptorTable(SRV(t0, flags=DESCRIPTORS_VOLATILE)), DescriptorTable(UAV(u0, flags=DESCRIPTORS_VOLATILE)), UAV(u1), UAV(u2)"
+#define RS "RootConstants(num32BitConstants=15, b0), DescriptorTable(SRV(t0, flags=DESCRIPTORS_VOLATILE)), DescriptorTable(UAV(u0, flags=DESCRIPTORS_VOLATILE)), UAV(u1), UAV(u2)"
 #define CX 64
 #define CY 36
 #define CELLS (CX * CY)
@@ -14,7 +14,7 @@ cbuffer Set : register(b0) {
     float level; float constant; float strength; float radius;
     float near; float tan_y; uint width; uint height;
     float follow; float most; float air; float lamps;
-    float cut; float floor_share;
+    float cut; float floor_share; float min_light;
 };
 Texture2D<float> depth : register(t0);
 // Cell radiance and mean log luminance, then the slow RGB mean at CELLS,
@@ -273,6 +273,7 @@ void raise(uint3 at : SV_DispatchThreadID) {
     found = clamp(found, 0.2 * all, 2.5 * all);
     found = lerp(found, cells[CELLS].rgb, 0.2) * level * open;
     if (floor_share > 0.0) found = max(found, floor_share * cells[GEO].x * level * open);
+    if (min_light > 0.0) found = max(found, float3(1.0, 0.98, 0.94) * min_light * open);
     float3 was = unpack(light[p]);
     // What the program left counts as far as it can be true: the sky's light
     // outdoors, not the blocks of other memory.
