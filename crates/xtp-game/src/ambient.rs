@@ -7,6 +7,9 @@ const LAYOUT: Layout = Layout {
     depth: (0, 464),
     radiance: (1, 16),
     air: (1, 32),
+    specular: (1, 104),
+    specular_depth: (0, 1000),
+    reflection_layers: &[0, 1],
 };
 
 /// The known build's programs, by the hash the runtime logs.
@@ -41,12 +44,38 @@ fn programs(executable_hash: &str) -> &'static [(&'static str, Role)] {
 /// Supplies the known build's hashes before any compute pipelines are made.
 /// Other builds can opt in with explicit hashes for the same view layout.
 pub fn configure(executable_hash: &str) {
-    xtp_gpu::ambient::configure(LAYOUT, programs(executable_hash));
+    let defaults = programs(executable_hash);
+    xtp_gpu::ambient::configure(
+        LAYOUT,
+        defaults,
+        (!defaults.is_empty()).then_some(reflection_miss),
+    );
+}
+
+fn reflection_miss(container: &[u8]) -> bool {
+    let prefix = b"CS_RayMiss_";
+    container.windows(prefix.len() + 9).any(|part| {
+        part.strip_prefix(prefix).is_some_and(|variant| {
+            variant[..8].iter().all(u8::is_ascii_hexdigit) && variant[8] == b'_'
+        })
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reflection_variants_exclude_other_miss_programs() {
+        assert!(reflection_miss(b"test_CS_RayMiss_a012BCde_suffix"));
+        for other in [
+            b"CS_RayMiss_volume_01234567_".as_slice(),
+            b"CS_Probe_RayMiss_01234567_",
+            b"CS_RayMiss_012345678_",
+        ] {
+            assert!(!reflection_miss(other));
+        }
+    }
 
     #[test]
     fn ambient_programs_apply_to_the_known_build_only() {
