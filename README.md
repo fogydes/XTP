@@ -266,10 +266,11 @@ cargo build --profile diag -p xtp --features diagnostics   # target\diag\xtp.exe
 | `XTP_HEAP_SYNC_EARLY=<ms>` | every Windows build: delay before the background thread scans dirty descriptor pages between submissions (`4` ms default, `0` disables early scans). Host descriptors are updated during the requested submission round, after earlier GPU work completes |
 | `XTP_HEAP_SYNC_THREADS=<n>` | every Windows build: worker threads used by parallel heap sync (`6` default, clamped to `1..=16`; `1` runs single-threaded) |
 | `XTP_QUICK_MIRROR=0` | every Windows build: with heap sync configured, disables the slot-lock bypass for unchanged resident texture SRVs and samplers read through draw tables (default on) |
+| `XTP_WIDE=1` | every build: enables parallel shadow refreshes, upload fills, texture refreshes, and copy-back scans (2–6 threads including the caller), plus AVX2 comparisons where supported. Unset or `0` uses the original submission and copy-back paths. |
 | `XTP_DIALOGS=auto` | every build: auto-dismisses `XGameUi` message and error dialogs without opening a window (message dialogs return `cancel_button`, error dialogs complete with `S_OK`; enabled automatically under `--autopilot`; does not affect text entry) |
 | `XTP_INDIRECT_REST=1` | every build: an indirect record that does not fit in its command list's remaining budget spends the rest of it so every later record in the list runs empty too (off by default, so an oversized record runs empty and later records that fit still run) |
 | `XTP_TEXTURE_BACK=<w>x<h>f<fmt>,...` | every Windows build: tiles UAV-written textures of the listed `(width, height, dxgi_format)` kinds back into title memory once their submission completes; `1` or unset uses the known build's defaults (off for unknown builds), `0`/`off` disables it |
-| `XTP_FAST_CORES=<0..3>` | every build: prefers performance CPU cores (`SetThreadSelectedCpuSets`) on hybrid processors; `0` off, `1` wait/completion threads, `2` (default) also buffer reserve helpers, `3` also pipeline worker pools |
+| `XTP_FAST_CORES=<0..3>` | every build: prefers performance CPU cores (`SetThreadSelectedCpuSets`) on hybrid processors; `0` off, `1` wait/completion threads, `2` (default) also buffer reserve helpers, `3` also pipeline and parallel submission worker pools |
 
 Every build appends crashes and host GPU failures to `crashes.log` in the
 title's data folder. The loader also prints the first 16 title C++ throws

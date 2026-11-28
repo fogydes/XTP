@@ -6,7 +6,7 @@
 //! commit `0b0074e0`, `GPL-3.0-or-later`).
 
 use windows_sys::Win32::System::SystemInformation::{
-    GetSystemCpuSetInformation, SYSTEM_CPU_SET_INFORMATION,
+    CpuSetInformation, GetSystemCpuSetInformation, SYSTEM_CPU_SET_INFORMATION,
 };
 use windows_sys::Win32::System::Threading::{
     GetCurrentProcess, GetCurrentThread, SetThreadSelectedCpuSets,
@@ -16,41 +16,57 @@ use windows_sys::Win32::System::Threading::{
 /// (higher is faster).
 fn cpu_sets() -> Vec<(u32, u8)> {
     let mut bytes = 0u32;
-    // SAFETY: a size query with a null buffer returns the needed byte length.
+    // SAFETY: size query with null output buffer.
     unsafe {
         GetSystemCpuSetInformation(std::ptr::null_mut(), 0, &mut bytes, GetCurrentProcess(), 0);
     }
-    let mut buffer = vec![0u64; (bytes as usize).div_ceil(8).max(1)];
+    if bytes == 0 {
+        return Vec::new();
+    }
+    let capacity = bytes;
+    let mut buffer = vec![0u64; (capacity as usize).div_ceil(8)];
     // SAFETY: `buffer` is 8-byte aligned and holds at least `bytes` bytes.
     let ok = unsafe {
         GetSystemCpuSetInformation(
             buffer.as_mut_ptr().cast(),
-            bytes,
+            capacity,
             &mut bytes,
             GetCurrentProcess(),
             0,
         )
     };
+    if ok == 0 || bytes > capacity {
+        return Vec::new();
+    }
     let mut sets = Vec::new();
-    let mut at = 0usize;
-    while ok != 0 && at + size_of::<SYSTEM_CPU_SET_INFORMATION>() <= bytes as usize {
-        // SAFETY: `at` is within `bytes` of initialized `SYSTEM_CPU_SET_INFORMATION` data.
-        let info = unsafe {
-            &*(buffer
-                .as_ptr()
-                .cast::<u8>()
-                .add(at)
-                .cast::<SYSTEM_CPU_SET_INFORMATION>())
+    let (mut at, end) = (0usize, bytes as usize);
+    let header = 2 * size_of::<u32>();
+    while end - at >= header {
+        // SAFETY: the remaining bytes contain a complete size/type header.
+        let ptr = unsafe { buffer.as_ptr().cast::<u8>().add(at) };
+        // SAFETY: both fields fit inside the initialized header.
+        let (size, kind) = unsafe {
+            (
+                ptr.cast::<u32>().read_unaligned() as usize,
+                ptr.add(4).cast::<i32>().read_unaligned(),
+            )
         };
-        if info.Size == 0 {
+        if size < header || size > end - at {
             break;
         }
-        // SAFETY: `GetSystemCpuSetInformation` emits `CpuSet` union records.
-        let set = unsafe { &info.Anonymous.CpuSet };
-        if set.Group == 0 {
-            sets.push((set.Id, set.EfficiencyClass));
+        if kind == CpuSetInformation && size >= size_of::<SYSTEM_CPU_SET_INFORMATION>() {
+            // SAFETY: a complete CPU-set record within the initialized buffer.
+            let set = unsafe {
+                ptr.cast::<SYSTEM_CPU_SET_INFORMATION>()
+                    .read_unaligned()
+                    .Anonymous
+                    .CpuSet
+            };
+            if set.Group == 0 {
+                sets.push((set.Id, set.EfficiencyClass));
+            }
         }
-        at += info.Size as usize;
+        at += size;
     }
     sets
 }
@@ -73,7 +89,7 @@ fn parse_stage(value: Option<&str>) -> u32 {
 
 /// `XTP_FAST_CORES`: `0` disables affinity hints; `1` pins completion/wait
 /// threads that a frame waits on; `2` (default) adds reserve helper threads;
-/// `3` also includes background pipeline worker pools.
+/// `3` also includes pipeline and parallel submission worker pools.
 fn stage() -> u32 {
     static STAGE: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
     *STAGE.get_or_init(|| parse_stage(std::env::var("XTP_FAST_CORES").ok().as_deref()))

@@ -3983,6 +3983,46 @@ mod tests {
         (resource, crate::resource::host_resource(resource).unwrap())
     }
 
+    #[test]
+    fn consecutive_texture_refreshes_stay_between_host_callbacks() {
+        let Some(gpu) =
+            crate::testgpu::device("consecutive_texture_refreshes_stay_between_host_callbacks")
+        else {
+            return;
+        };
+        let (a, a_texture) = texture_4x4(0x31);
+        let (b, b_texture) = texture_4x4(0x42);
+        let a_stage = staging(a, a_texture).unwrap();
+        let b_stage = staging(b, b_texture).unwrap();
+        let list = gpu.host().new_list().unwrap();
+        let counts = [a_stage.clone(), b_stage.clone()];
+        list.defer_host((0, 0), move || {
+            for stage in &counts {
+                assert_eq!(stage.written.load(Ordering::Acquire), 0);
+            }
+        });
+        list.defer_texture(a_stage.clone());
+        list.defer_texture(b_stage.clone());
+        list.defer_host((0, 0), move || {
+            for (stage, byte) in [(&a_stage, 0x31), (&b_stage, 0x42)] {
+                assert_eq!(stage.written.load(Ordering::Acquire), 1);
+                let upload = stage.upload.lock().unwrap_or_else(|e| e.into_inner());
+                let upload = upload
+                    .as_ref()
+                    .expect("refresh detiled to an upload buffer");
+                // SAFETY: the guard keeps the mapping alive. The first
+                // 16 bytes are the first RGBA8 row, populated by the refresh.
+                let row = unsafe { std::slice::from_raw_parts(upload.data, 16) };
+                assert_eq!(row, [byte; 16]);
+            }
+        });
+        list.close();
+        gpu.host().execute(&[&list]);
+        gpu.host().drain();
+        release(a);
+        release(b);
+    }
+
     /// What native D3D12 holds after copies of 2×2 blocks of the given
     /// texels at the given places, in submission order, over `background`.
     fn expected(background: u32, copies: &[((u32, u32), u32)]) -> Vec<u32> {

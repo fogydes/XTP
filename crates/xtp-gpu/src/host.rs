@@ -749,6 +749,265 @@ mod tests {
         assert_eq!(ranges(&batch), [(48, 52)]);
     }
 
+    #[test]
+    fn wide_fills_finish_before_a_host_callback_and_keep_overlapping_fill_order() {
+        let Some(gpu) = crate::testgpu::device("wide_fills_finish_before_a_host_callback") else {
+            return;
+        };
+        let list = gpu.host().new_list().unwrap();
+        let source = Box::new([0x11u8, 0x22, 0x33]);
+        let mut upload = Box::new([0u8; 4]);
+        let src = source.as_ptr();
+        let dst = upload.as_mut_ptr();
+        for i in 0..128 {
+            let offset = i % 2;
+            // SAFETY: each pointer is inside its own allocation.
+            unsafe { list.defer_fill(dst.add(offset), src.add(offset), 1) };
+        }
+        let addr = dst as usize;
+        list.defer_host((0, 0), move || {
+            // SAFETY: the test owns this upload allocation through the callback.
+            let filled = unsafe { std::slice::from_raw_parts(addr as *const u8, 4) };
+            assert_eq!(filled, [0x11, 0x22, 0, 0]);
+        });
+        // SAFETY: both pointers are inside their allocations.
+        unsafe { list.defer_fill(dst.add(1), src.add(2), 1) };
+        list.run_deferred_with(&mut Batch::default(), true);
+        assert_eq!(*upload, [0x11, 0x33, 0, 0]);
+
+        let mut batch = Batch::default();
+        let src = src as usize;
+        batch
+            .fills
+            .extend((0..128).map(|i| (addr + i % 2, src + i % 3, 1)));
+        assert!(!batch.fills_disjoint());
+        batch.fill_with(true);
+        // 126 is the last fill of byte 0 and 127 is the last of byte 1.
+        assert_eq!(*upload, [0x11, 0x22, 0, 0]);
+    }
+
+    /// Concurrent shadow refreshes, batched fills, and parallel copy-back over
+    /// 16 shadows on WARP produce the exact same bytes as the single-threaded
+    /// path, preserving title writes (including three-way title-wins bytes).
+    #[test]
+    fn wide_refreshes_and_copy_back_over_16_shadows_match_single_threaded() {
+        use crate::watch::PAGE;
+
+        let test =
+            "host::tests::wide_refreshes_and_copy_back_over_16_shadows_match_single_threaded";
+        let Some(gpu) = crate::testgpu::device(test) else {
+            return;
+        };
+        let host = gpu.host();
+        let kernel = crate::testgpu::Kernel::new(host);
+
+        const SHADOWS: usize = 16;
+        const LEN: usize = 2 * PAGE;
+        const FILLS: usize = 140;
+
+        let initial = |shadow: usize, word: usize| {
+            ((shadow as u32 + 1) << 24) ^ (word as u32).wrapping_mul(0x9e37_79b9)
+        };
+        let title_byte = |shadow, offset: usize| {
+            initial(shadow, offset / 4).to_le_bytes()[offset % 4] ^ (0x50 + shadow) as u8
+        };
+        let run_case = |wide: bool| -> (Vec<Vec<u8>>, Vec<Vec<u8>>, Vec<u8>) {
+            // 1. Batched upload fills above the parallel threshold (FEW = 96).
+            let src_fill: Vec<u8> = (0..FILLS * 16)
+                .map(|i| (i.wrapping_mul(37) + 11) as u8)
+                .collect();
+            let mut dst_fill = vec![0xeeu8; FILLS * 16];
+            let mut fill_batch = Batch::default();
+            for i in 0..FILLS {
+                fill_batch.fills.push((
+                    dst_fill.as_mut_ptr() as usize + i * 16,
+                    src_fill.as_ptr() as usize + i * 16,
+                    16,
+                ));
+            }
+            fill_batch.fill_with(wide);
+            assert_eq!(dst_fill, src_fill, "fills must match source (wide={wide})");
+
+            // 2. 16 independent title buffers + shadows.
+            let buffers: Vec<crate::testgpu::TitleBuffer> = (0..SHADOWS)
+                .map(|_| crate::testgpu::TitleBuffer::new(LEN))
+                .collect();
+            let shadows: Vec<std::sync::Arc<crate::shadow::Shadow>> =
+                buffers.iter().map(|b| b.shadow()).collect();
+
+            for (s, buf) in buffers.iter().enumerate() {
+                buf.set_words(|w| initial(s, w));
+            }
+
+            // Disjoint intervals per shadow, added interleaved across shadows so
+            // Batch::flush_all must group them per shadow cleanly.
+            let mut batch = Batch::default();
+            for &(offset, len) in &[(PAGE + 0x200, 0x400), (0x100, 0x300), (0x800, 0x200)] {
+                for (s, buf) in buffers.iter().enumerate() {
+                    batch.add(&shadows[s], buf.address() as usize + offset, len);
+                }
+            }
+            batch.flush_all(wide);
+            for (s, buf) in buffers.iter().enumerate() {
+                let base = buf.address() as usize;
+                // SAFETY: `buf` owns `LEN` bytes of committed title memory.
+                let title = unsafe { std::slice::from_raw_parts(base as *const u8, LEN) };
+                for &(offset, len) in &[(0x100, 0x300), (0x800, 0x200), (PAGE + 0x200, 0x400)] {
+                    assert_eq!(
+                        shadows[s].host_bytes(base + offset, len),
+                        title[offset..offset + len],
+                        "disjoint refresh shadow {s} offset {offset:#x} (wide={wide})"
+                    );
+                }
+            }
+
+            // Refresh all 16 shadows whole, then take snapshots for one submission.
+            for (s, buf) in buffers.iter().enumerate() {
+                batch.add(&shadows[s], buf.address() as usize, LEN);
+            }
+            batch.flush_all(wide);
+
+            let sub = crate::shadow::submission();
+            for (s, buf) in buffers.iter().enumerate() {
+                shadows[s].writing(sub, buf.address() as usize + 1, LEN - 3);
+            }
+
+            // Run a real WARP compute dispatch writing 256 bytes into both pages
+            // of every shadow.
+            let list = host.new_list().unwrap();
+            for (s, buf) in buffers.iter().enumerate() {
+                let base = buf.address();
+                kernel.dispatch_fill_raw(&list, &shadows[s], base + 0x100);
+                kernel.dispatch_fill_raw(&list, &shadows[s], base + PAGE as u64 + 0x200);
+            }
+            list.close();
+            host.execute(&[&list]);
+            host.drain();
+
+            // Simulate concurrent title CPU writes while the GPU ran:
+            // - overlapping with the GPU write at 0x108..0x118 (title must win)
+            // - outside the GPU write at 0x400..0x420 and PAGE + 0x500..0x520
+            for (s, buf) in buffers.iter().enumerate() {
+                let base = buf.address() as usize;
+                let tag = (0x50 + s) as u8;
+                // SAFETY: inside `buf`'s committed allocation.
+                unsafe {
+                    for offset in 0x108..0x118 {
+                        // Flip bits relative to the exact preimage so every
+                        // byte here counts as a title write in the merge.
+                        ((base + offset) as *mut u8).write(title_byte(s, offset));
+                    }
+                    std::ptr::write_bytes((base + 0x400) as *mut u8, tag ^ 0x2a, 32);
+                    std::ptr::write_bytes((base + PAGE + 0x500) as *mut u8, tag ^ 0x55, 32);
+                }
+            }
+
+            let back: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)> = buffers
+                .iter()
+                .enumerate()
+                .map(|(s, buf)| (shadows[s].clone(), buf.address() as usize + 1, LEN - 3))
+                .collect();
+            let written = crate::shadow::copy_back_all_with(sub, &back, wide);
+            assert!(written > 0, "expected GPU bytes written back (wide={wide})");
+
+            let mut titles = Vec::with_capacity(SHADOWS);
+            let mut hosts = Vec::with_capacity(SHADOWS);
+            for (s, buf) in buffers.iter().enumerate() {
+                let base = buf.address() as usize;
+                // SAFETY: inside `buf`'s committed allocation.
+                let title = unsafe { std::slice::from_raw_parts(base as *const u8, LEN) }.to_vec();
+                let host_mem = shadows[s].host_bytes(base, LEN);
+
+                // Verify three-way title-wins and GPU-only bytes on every shadow.
+                let tag = (0x50 + s) as u8;
+                assert!(
+                    (0x108..0x118).all(|i| title[i] == title_byte(s, i)),
+                    "shadow {s}: overlapping title write must win (wide={wide})"
+                );
+                assert!(
+                    (0x108..0x118).all(|i| host_mem[i] == title_byte(s, i)),
+                    "shadow {s}: host copy must take winning title write (wide={wide})"
+                );
+                assert!(
+                    title[0x400..0x420].iter().all(|&b| b == tag ^ 0x2a),
+                    "shadow {s}: title write on page 0 must be preserved (wide={wide})"
+                );
+                assert!(
+                    title[PAGE + 0x500..PAGE + 0x520]
+                        .iter()
+                        .all(|&b| b == tag ^ 0x55),
+                    "shadow {s}: title write on page 1 must be preserved (wide={wide})"
+                );
+                // First GPU word at 0x100 (word 0 of pattern) and 0x118 (word 6).
+                assert_eq!(
+                    u32::from_le_bytes(title[0x100..0x104].try_into().unwrap()),
+                    crate::testgpu::pattern(0),
+                    "shadow {s}: GPU write at 0x100 must land (wide={wide})"
+                );
+                assert_eq!(
+                    u32::from_le_bytes(title[0x118..0x11c].try_into().unwrap()),
+                    crate::testgpu::pattern(6),
+                    "shadow {s}: GPU write at 0x118 must land (wide={wide})"
+                );
+                assert_eq!(
+                    u32::from_le_bytes(title[PAGE + 0x200..PAGE + 0x204].try_into().unwrap()),
+                    crate::testgpu::pattern(0),
+                    "shadow {s}: GPU write on page 1 must land (wide={wide})"
+                );
+
+                titles.push(title);
+                hosts.push(host_mem);
+            }
+            (titles, hosts, dst_fill)
+        };
+
+        let (single_titles, single_hosts, single_fills) = run_case(false);
+        let (wide_titles, wide_hosts, wide_fills) = run_case(true);
+        assert_eq!(
+            wide_fills, single_fills,
+            "wide fills must match single-threaded"
+        );
+        for s in 0..SHADOWS {
+            assert_eq!(
+                wide_titles[s], single_titles[s],
+                "shadow {s}: wide title memory must match single-threaded byte-for-byte"
+            );
+            assert_eq!(
+                wide_hosts[s], single_hosts[s],
+                "shadow {s}: wide host copy must match single-threaded byte-for-byte"
+            );
+        }
+
+        // End-to-end submission through Host::execute / Host::complete over 16 shadows.
+        let src_buffers: Vec<crate::testgpu::TitleBuffer> = (0..SHADOWS)
+            .map(|_| crate::testgpu::TitleBuffer::new(4096))
+            .collect();
+        let dst_buffers: Vec<crate::testgpu::TitleBuffer> = (0..SHADOWS)
+            .map(|_| crate::testgpu::TitleBuffer::new(4096))
+            .collect();
+        for (s, buf) in src_buffers.iter().enumerate() {
+            buf.set_words(|w| ((s as u32 + 1) << 16) | (w as u32));
+        }
+        let list = crate::testgpu::TitleList::new();
+        for (src, dst) in src_buffers.iter().zip(&dst_buffers) {
+            kernel.dispatch(
+                list.host(),
+                crate::testgpu::Pass::Copy,
+                src.address(),
+                dst.address(),
+            );
+        }
+        list.run();
+        for (s, dst) in dst_buffers.iter().enumerate() {
+            let expected: Vec<u32> = (0..64).map(|w| ((s as u32 + 1) << 16) | w).collect();
+            assert_eq!(
+                &dst.words()[..64],
+                &expected[..],
+                "end-to-end WARP copy over 16 shadows failed at shadow {s}"
+            );
+        }
+    }
+
     #[cfg(feature = "diagnostics")]
     #[test]
     fn recorded_preserves_both_diagnostic_samples_without_deadlock() {
@@ -2313,10 +2572,8 @@ impl Host {
             let written = shadow.write_back(p.submission, *address, *len);
             COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
         }
-        for (shadow, address, len) in &p.back {
-            let written = shadow.copy_back(p.submission, *address, *len);
-            COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
-        }
+        let written = crate::shadow::copy_back_all(p.submission, &p.back);
+        COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
         for back in &p.texture_backs {
             let written = crate::texback::land(back);
             COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
@@ -3480,6 +3737,10 @@ impl HostList {
     /// (the title's big buffers, a 174 MB one among them, are read by most
     /// lists of a submission, through many ranges).
     fn run_deferred(&self, batch: &mut Batch<'_>) {
+        self.run_deferred_with(batch, crate::workers::wide());
+    }
+
+    fn run_deferred_with(&self, batch: &mut Batch<'_>, wide: bool) {
         #[cfg(feature = "diagnostics")]
         use crate::copystat::{C, add};
         use preparation::Kind;
@@ -3487,6 +3748,17 @@ impl HostList {
         let deferred = self.deferred();
         batch.work.merged_fills += deferred.merged_fills;
         for step in &deferred.copies {
+            if wide {
+                // Deferred callbacks can observe upload memory or change
+                // which texture should be refreshed. Keep runs within their
+                // original position in this list, before its late copies.
+                if !matches!(step, Step::Fill(..)) {
+                    batch.fill_with(true);
+                }
+                if !matches!(step, Step::Texture(..)) {
+                    batch.refresh_textures();
+                }
+            }
             let kind = match step {
                 &Step::Copy(dst, src, len) => {
                     #[cfg(feature = "diagnostics")]
@@ -3509,11 +3781,22 @@ impl HostList {
                         add(C::Copies, 1);
                         add(C::CopyBytes, len as u64);
                     }
-                    batch.settle(src, len, false);
-                    let _fill = Phase::Fills.enter();
-                    // SAFETY: la liste conserve la destination mappée et indépendante
-                    // de la mémoire du titre jusqu’à la fin de la soumission.
-                    unsafe { crate::shadow::fill_upload(dst as *mut u8, src, len) };
+                    if wide {
+                        if let Some(value) = batch.read_conflict(src, len) {
+                            batch.fill_with(true);
+                            batch
+                                .host
+                                .expect("conflict belongs to the host")
+                                .settle(value);
+                        }
+                        batch.fills.push((dst, src, len));
+                    } else {
+                        batch.settle(src, len, false);
+                        let _fill = Phase::Fills.enter();
+                        // SAFETY: the list keeps the upload destination mapped
+                        // and disjoint from title memory through submission.
+                        unsafe { crate::shadow::fill_upload(dst as *mut u8, src, len) };
+                    }
                     batch.work.fill_bytes += len as u64;
                     Kind::Fill
                 }
@@ -3592,10 +3875,18 @@ impl HostList {
                 Step::Texture(staging) => {
                     if batch.texture_due(staging) {
                         let (from, to) = staging.range();
-                        batch.settle(from, to - from, false);
-                        let _texture = Phase::Textures.enter();
-                        batch.work.texture_bytes +=
-                            staging.refresh(|| batch.settle_staging(staging)) as u64;
+                        if wide
+                            && batch.read_conflict(from, to - from).is_none()
+                            && !batch.has_staging_conflict(staging)
+                        {
+                            batch.texture_runs.push(staging.clone());
+                        } else {
+                            batch.refresh_textures();
+                            batch.settle(from, to - from, false);
+                            let _texture = Phase::Textures.enter();
+                            batch.work.texture_bytes +=
+                                staging.refresh(|| batch.settle_staging(staging)) as u64;
+                        }
                     }
                     Kind::Texture
                 }
@@ -3638,6 +3929,10 @@ impl HostList {
             };
             batch.work.steps[kind as usize] += 1;
         }
+        if wide {
+            batch.fill_with(true);
+            batch.refresh_textures();
+        }
     }
 }
 
@@ -3653,6 +3948,11 @@ impl HostList {
 struct Batch<'a> {
     work: preparation::Work,
     refreshes: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
+    /// Consecutive upload fills and scratch for checking their destinations.
+    fills: Vec<(usize, usize, usize)>,
+    fill_destinations: Vec<(usize, usize)>,
+    /// Consecutive distinct staging buffers with no earlier in-flight users.
+    texture_runs: Vec<std::sync::Arc<crate::texture::Staging>>,
     /// Staging buffers (by address) refreshed since the last title write.
     textures: std::collections::HashSet<usize>,
     /// The host, whose earlier submissions may still be in flight.
@@ -3760,6 +4060,87 @@ impl Batch<'_> {
             .insert(std::sync::Arc::as_ptr(staging) as *const () as usize)
     }
 
+    /// Whether an earlier in-flight submission still reads `staging`.
+    fn has_staging_conflict(&self, staging: &crate::texture::Staging) -> bool {
+        self.host.is_some_and(|host| {
+            host.timeline
+                .staging_conflict(std::ptr::from_ref(staging) as usize)
+                .is_some()
+        })
+    }
+
+    fn read_conflict(&self, address: usize, len: usize) -> Option<u64> {
+        self.host?
+            .timeline
+            .conflict(address, address.saturating_add(len), false)
+    }
+
+    fn refresh_textures(&mut self) {
+        if self.texture_runs.is_empty() {
+            return;
+        }
+        let _texture = Phase::Textures.enter();
+        let bytes = std::sync::atomic::AtomicUsize::new(0);
+        crate::workers::each_wide(self.texture_runs.len(), &|i| {
+            // Submission is serialized. The earlier staging users and
+            // writers were ruled out before this run was queued.
+            bytes.fetch_add(self.texture_runs[i].refresh(|| ()), Ordering::Relaxed);
+        });
+        self.texture_runs.clear();
+        self.work.texture_bytes += bytes.into_inner() as u64;
+    }
+
+    /// Checks that no write in the batch can overlap another read or write.
+    fn fills_disjoint(&mut self) -> bool {
+        let destinations = &mut self.fill_destinations;
+        destinations.clear();
+        destinations.extend(
+            self.fills
+                .iter()
+                .filter(|f| f.2 != 0)
+                .map(|&(dst, _, len)| (dst, dst.saturating_add(len))),
+        );
+        destinations.sort_unstable();
+        destinations.windows(2).all(|w| w[0].1 <= w[1].0)
+            && self.fills.iter().all(|&(_, src, len)| {
+                if len == 0 {
+                    return true;
+                }
+                let i = destinations.partition_point(|&(_, end)| end <= src);
+                destinations
+                    .get(i)
+                    .is_none_or(|&(dst, _)| src.saturating_add(len) <= dst)
+            })
+    }
+
+    fn fill_with(&mut self, wide: bool) {
+        const FEW: usize = 96;
+        const PART: usize = 64;
+        if self.fills.is_empty() {
+            return;
+        }
+        let _fill = Phase::Fills.enter();
+        let parallel = wide && self.fills.len() >= FEW && self.fills_disjoint();
+        let fill = |&(dst, src, len): &(usize, usize, usize)| {
+            // SAFETY: recording holds each mapped upload destination and
+            // keeps it disjoint from its source. A parallel run also checked
+            // destination ranges against one another and every source.
+            unsafe { crate::shadow::fill_upload(dst as *mut u8, src, len) };
+        };
+        if parallel {
+            let fills = &self.fills;
+            crate::workers::each_wide(fills.len().div_ceil(PART), &|i| {
+                let from = i * PART;
+                fills[from..(from + PART).min(fills.len())]
+                    .iter()
+                    .for_each(fill);
+            });
+        } else {
+            self.fills.iter().for_each(fill);
+        }
+        self.fills.clear();
+    }
+
     /// Before a step that writes title memory: pending refreshes are done
     /// first, and textures are checked again after it.
     fn title_written(&mut self) {
@@ -3782,18 +4163,62 @@ impl Batch<'_> {
         let count = self.refreshes[first..]
             .partition_point(|(s, from, _)| (std::sync::Arc::as_ptr(s), *from) < (key, end));
         for (shadow, from, to) in self.refreshes.drain(first..first + count) {
-            self.work.copy_bytes += Self::refresh(&shadow, from, to) as u64;
+            let _copy = Phase::Copies.enter();
+            self.work.copy_bytes += Self::refresh_inner(&shadow, from, to) as u64;
         }
     }
 
     fn flush(&mut self) {
-        for (shadow, from, to) in self.refreshes.drain(..) {
-            self.work.copy_bytes += Self::refresh(&shadow, from, to) as u64;
-        }
+        self.flush_all(crate::workers::wide());
     }
 
-    fn refresh(shadow: &crate::shadow::Shadow, from: usize, to: usize) -> usize {
+    /// Flushes all pending disjoint shadow refreshes. When `wide` is enabled
+    /// and multiple shadows are queued, ranges are grouped by shadow so no two
+    /// worker threads ever contend on the same shadow's lock.
+    fn flush_all(&mut self, wide: bool) {
+        if self.refreshes.is_empty() {
+            return;
+        }
+        let one_shadow = std::sync::Arc::ptr_eq(
+            &self.refreshes.first().expect("nonempty").0,
+            &self.refreshes.last().expect("nonempty").0,
+        );
+        if !wide || one_shadow {
+            for (shadow, from, to) in self.refreshes.drain(..) {
+                let _copy = Phase::Copies.enter();
+                self.work.copy_bytes += Self::refresh_inner(&shadow, from, to) as u64;
+            }
+            return;
+        }
         let _copy = Phase::Copies.enter();
+        let refreshes = &self.refreshes;
+        // `refreshes` is sorted by `(Arc::as_ptr(shadow), from)`, so each
+        // contiguous run belongs to one shadow.
+        let mut groups: Vec<std::ops::Range<usize>> = Vec::new();
+        let mut start = 0;
+        while start < refreshes.len() {
+            let mut end = start + 1;
+            while end < refreshes.len()
+                && std::sync::Arc::ptr_eq(&refreshes[start].0, &refreshes[end].0)
+            {
+                end += 1;
+            }
+            groups.push(start..end);
+            start = end;
+        }
+        let copied = std::sync::atomic::AtomicUsize::new(0);
+        crate::workers::each_wide(groups.len(), &|g| {
+            let mut mine = 0usize;
+            for (shadow, from, to) in &refreshes[groups[g].clone()] {
+                mine += Self::refresh_inner(shadow, *from, *to);
+            }
+            copied.fetch_add(mine, Ordering::Relaxed);
+        });
+        self.refreshes.clear();
+        self.work.copy_bytes += copied.into_inner() as u64;
+    }
+
+    fn refresh_inner(shadow: &crate::shadow::Shadow, from: usize, to: usize) -> usize {
         #[cfg(feature = "diagnostics")]
         let started = std::time::Instant::now();
         let copied = shadow.update(from, to - from);

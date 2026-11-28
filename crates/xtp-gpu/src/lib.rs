@@ -22,6 +22,8 @@ mod agility;
 pub mod ambient;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod capture;
+#[cfg(windows)]
+mod compare;
 pub mod console;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod copystat;
@@ -114,6 +116,8 @@ mod timestamps;
 pub mod uma;
 #[cfg(windows)]
 mod watch;
+#[cfg(windows)]
+mod workers;
 
 #[cfg(windows)]
 pub use host::on_failure;
