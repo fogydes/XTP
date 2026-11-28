@@ -2133,7 +2133,7 @@ impl Host {
         // about to rewrite. The submission lock excludes new executions
         // while the mirror runs. The disabled path does not drain.
         let mut heaps_synced =
-            is_title.then(|| crate::descriptor::begin_sync_heaps(|| self.drain()));
+            is_title.then(|| crate::descriptor::begin_sync_heaps(|| self.drain_gpu()));
         for list in runs {
             list.submitting(|| {
                 if let Some(sync) = heaps_synced.take() {
@@ -2321,6 +2321,15 @@ impl Host {
     pub(crate) fn drain(&self) {
         if let Some((_, newest)) = self.timeline.span() {
             self.settle(newest);
+        }
+    }
+
+    /// Waits for the GPU to finish every submission made so far without
+    /// blocking on synchronous CPU copy-back.
+    #[track_caller]
+    fn drain_gpu(&self) {
+        if let Some((_, newest)) = self.timeline.span() {
+            self.waiting(|| self.wait_gpu(newest));
         }
     }
 
@@ -4191,6 +4200,28 @@ impl Batch<'_> {
         if self.refreshes.is_empty() {
             return;
         }
+        let (polled_now, unwatched) = if self.refreshes.len() > 1 {
+            let page_ranges: Vec<(usize, usize)> = self
+                .refreshes
+                .iter()
+                .filter(|(s, from, to)| from < to && s.can_batch_poll())
+                .map(|(_, from, to)| (from / crate::watch::PAGE, to.div_ceil(crate::watch::PAGE)))
+                .collect();
+            crate::watch::poll_merged(&page_ranges)
+        } else {
+            (0, Vec::new())
+        };
+        let refresh = |shadow: &crate::shadow::Shadow, from: usize, to: usize| {
+            if polled_now != 0 && from < to && shadow.can_batch_poll() {
+                let first = from / crate::watch::PAGE;
+                let last = to.div_ceil(crate::watch::PAGE);
+                let i = unwatched.partition_point(|&(_, e)| e <= first);
+                if unwatched.get(i).is_none_or(|&(a, _)| a >= last) {
+                    return Self::refresh_inner_polled(shadow, from, to, polled_now);
+                }
+            }
+            Self::refresh_inner(shadow, from, to)
+        };
         let one_shadow = std::sync::Arc::ptr_eq(
             &self.refreshes.first().expect("nonempty").0,
             &self.refreshes.last().expect("nonempty").0,
@@ -4198,7 +4229,7 @@ impl Batch<'_> {
         if !wide || one_shadow {
             for (shadow, from, to) in self.refreshes.drain(..) {
                 let _copy = Phase::Copies.enter();
-                self.work.copy_bytes += Self::refresh_inner(&shadow, from, to) as u64;
+                self.work.copy_bytes += refresh(&shadow, from, to) as u64;
             }
             return;
         }
@@ -4222,7 +4253,7 @@ impl Batch<'_> {
         crate::workers::each_wide(groups.len(), &|g| {
             let mut mine = 0usize;
             for (shadow, from, to) in &refreshes[groups[g].clone()] {
-                mine += Self::refresh_inner(shadow, *from, *to);
+                mine += refresh(shadow, *from, *to);
             }
             copied.fetch_add(mine, Ordering::Relaxed);
         });
@@ -4234,6 +4265,20 @@ impl Batch<'_> {
         #[cfg(feature = "diagnostics")]
         let started = std::time::Instant::now();
         let copied = shadow.update(from, to - from);
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::range(from, to - from, started.elapsed().as_micros() as u64, 0);
+        copied
+    }
+
+    fn refresh_inner_polled(
+        shadow: &crate::shadow::Shadow,
+        from: usize,
+        to: usize,
+        polled_now: u64,
+    ) -> usize {
+        #[cfg(feature = "diagnostics")]
+        let started = std::time::Instant::now();
+        let copied = shadow.update_polled(from, to - from, polled_now);
         #[cfg(feature = "diagnostics")]
         crate::copystat::range(from, to - from, started.elapsed().as_micros() as u64, 0);
         copied

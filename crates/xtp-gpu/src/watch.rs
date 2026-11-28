@@ -170,6 +170,110 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<u64> {
     with_writes(start, end, guarded, |now| now)
 }
 
+/// Polls write-watching and section guards across `ranges` (each a half-open
+/// `PAGE`-indexed range `(first_page, last_page)`) under a single `JOURNAL`
+/// lock after sorting and coalescing overlapping or adjacent ranges.
+///
+/// Returns `(now, unwatched)` where every dirty page across the polled spans
+/// has been stamped with `now` (`last_write(page) == now`) and `unwatched`
+/// holds sorted, coalesced page ranges that neither `GetWriteWatch` nor
+/// `guard` could answer for (caller should fall back to `Shadow::update`).
+pub(crate) fn poll_merged(ranges: &[(usize, usize)]) -> (u64, Vec<(usize, usize)>) {
+    let mut todo: Vec<(usize, usize)> = ranges.iter().copied().filter(|&(a, b)| a < b).collect();
+    if todo.is_empty() {
+        return (0, Vec::new());
+    }
+    let _watch = crate::host::preparation::Phase::Watch.enter();
+    todo.sort_unstable();
+    let mut merged: Vec<(usize, usize)> = Vec::with_capacity(todo.len());
+    for (a, b) in todo {
+        if let Some(last) = merged.last_mut()
+            && a <= last.1
+        {
+            last.1 = last.1.max(b);
+        } else {
+            merged.push((a, b));
+        }
+    }
+
+    let (now, unwatched) = {
+        let mut guard_lock = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+        let j = &mut *guard_lock;
+        #[cfg(feature = "diagnostics")]
+        let started = std::time::Instant::now();
+        let ask_guard = |first: usize, last: usize| -> Option<Vec<usize>> {
+            #[cfg(feature = "diagnostics")]
+            let guarding = std::time::Instant::now();
+            let written = guard(first * PAGE, last * PAGE);
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::add(
+                crate::copystat::C::GuardUs,
+                guarding.elapsed().as_micros() as u64,
+            );
+            written
+        };
+
+        let mut stamps = Vec::new();
+        let mut unwatched: Vec<(usize, usize)> = Vec::new();
+        let mut stack: Vec<(usize, usize)> = merged.into_iter().rev().collect();
+        while let Some((a, b)) = stack.pop() {
+            if KNOWN_VIEWS.contains(a) {
+                let mut k = a + 1;
+                while k < b && KNOWN_VIEWS.contains(k) {
+                    k += 1;
+                }
+                if k < b {
+                    stack.push((k, b));
+                }
+                if let Some(dirty) = ask_guard(a, k) {
+                    stamps.extend(dirty);
+                } else {
+                    unwatched.push((a, k));
+                }
+                continue;
+            }
+            if let Some(count) = j.poll(a..b) {
+                stamps.extend(j.found[..count].iter().map(|&at| at / PAGE));
+            } else if b - a > 1 {
+                let mid = a + (b - a) / 2;
+                stack.push((mid, b));
+                stack.push((a, mid));
+            } else if let Some(dirty) = ask_guard(a, b) {
+                stamps.extend(dirty);
+            } else {
+                unwatched.push((a, b));
+            }
+        }
+
+        #[cfg(feature = "diagnostics")]
+        {
+            use crate::copystat::{C, add};
+            add(C::Watches, 1);
+            add(C::WatchUs, started.elapsed().as_micros() as u64);
+        }
+        j.asked += 1;
+        let now = j.asked;
+        for page in stamps {
+            stamp(page, now);
+        }
+        (now, unwatched)
+    };
+    let mut unwatched = unwatched;
+
+    unwatched.sort_unstable();
+    let mut merged_unwatched: Vec<(usize, usize)> = Vec::with_capacity(unwatched.len());
+    for (a, b) in unwatched {
+        if let Some(last) = merged_unwatched.last_mut()
+            && a <= last.1
+        {
+            last.1 = last.1.max(b);
+        } else {
+            merged_unwatched.push((a, b));
+        }
+    }
+    (now, merged_unwatched)
+}
+
 fn with_writes<T>(
     start: usize,
     end: usize,
@@ -3627,5 +3731,55 @@ pub(crate) mod tests {
         unmapped(other, BLOCKS);
         // SAFETY: our section handle.
         unsafe { windows_sys::Win32::Foundation::CloseHandle(section) };
+    }
+
+    #[test]
+    fn poll_merged_coalesces_disjoint_and_adjacent_write_watched_pages() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+        };
+        const MEM_WRITE_WATCH: u32 = 0x20_0000;
+        let _serial = serial();
+        let alloc = |pages: usize| -> usize {
+            // SAFETY: plain private write-watched reservation/commit for the test.
+            let p = unsafe {
+                VirtualAlloc(
+                    std::ptr::null(),
+                    pages * PAGE,
+                    MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH,
+                    PAGE_READWRITE,
+                )
+            };
+            assert!(!p.is_null());
+            p as usize
+        };
+        let a = alloc(4);
+        let b = alloc(3);
+        let base_a = a / PAGE;
+        let base_b = b / PAGE;
+        // Clear initial allocation dirty state, then touch page 0 & 2 of `a` and page 1 of `b`.
+        let _ = poll_merged(&[(base_a, base_a + 4), (base_b, base_b + 3)]);
+        // SAFETY: committed pages inside `a` and `b`.
+        unsafe {
+            *(a as *mut u8) = 1;
+            *((a + 2 * PAGE) as *mut u8) = 2;
+            *((b + PAGE) as *mut u8) = 3;
+        }
+        let (now, unwatched) = poll_merged(&[
+            (base_a, base_a + 2),
+            (base_a + 2, base_a + 4),
+            (base_b, base_b + 3),
+        ]);
+        assert!(unwatched.is_empty());
+        assert_eq!(last_write(base_a), now);
+        assert!(last_write(base_a + 1) < now);
+        assert_eq!(last_write(base_a + 2), now);
+        assert!(last_write(base_a + 3) < now);
+        assert_eq!(last_write(base_b + 1), now);
+        // SAFETY: allocations obtained from VirtualAlloc above.
+        unsafe {
+            assert_ne!(VirtualFree(a as *mut _, 0, MEM_RELEASE), 0);
+            assert_ne!(VirtualFree(b as *mut _, 0, MEM_RELEASE), 0);
+        }
     }
 }

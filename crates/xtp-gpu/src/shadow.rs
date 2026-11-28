@@ -1275,6 +1275,22 @@ impl Shadow {
     /// write-watched), but where GPU work in flight writes the copy.
     /// Returns the bytes copied.
     pub(crate) fn update(&self, address: usize, len: usize) -> usize {
+        self.update_with(address, len, None)
+    }
+
+    /// Whether [`Self::update`] can use a batch write-watch poll
+    /// ([`crate::watch::poll_merged`] + [`Self::update_polled`]).
+    pub(crate) fn can_batch_poll(&self) -> bool {
+        once() && self.watched.load(Ordering::Relaxed) != NOT_WATCHED && !whole_ranges()
+    }
+
+    /// Like [`Self::update`], reusing a batch write-watch poll number
+    /// `polled_now` so parallel refreshes do not contend on `JOURNAL`.
+    pub(crate) fn update_polled(&self, address: usize, len: usize, polled_now: u64) -> usize {
+        self.update_with(address, len, Some(polled_now))
+    }
+
+    fn update_with(&self, address: usize, len: usize, polled: Option<u64>) -> usize {
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let (from, to) = (address.max(start), (address + len).min(end));
         if from >= to {
@@ -1288,7 +1304,7 @@ impl Shadow {
             .collect();
         busy.sort_unstable();
         let copied = if once() {
-            self.update_once(from, to, &busy)
+            self.update_once(from, to, &busy, polled)
         } else {
             self.update_gaps(from, to, busy)
         };
@@ -1310,7 +1326,13 @@ impl Shadow {
     /// of the write watch for the whole range (the journal keeps what it
     /// finds in the busy ranges for later refreshes), then the pages
     /// written since their last copy in each gap.
-    fn update_once(&self, from: usize, to: usize, busy: &[(usize, usize)]) -> usize {
+    fn update_once(
+        &self,
+        from: usize,
+        to: usize,
+        busy: &[(usize, usize)],
+        polled: Option<u64>,
+    ) -> usize {
         let mut gaps = Vec::with_capacity(busy.len() + 1);
         let mut at = from;
         for &(a, e) in busy {
@@ -1323,9 +1345,15 @@ impl Shadow {
             gaps.push((at, to));
         }
         if self.watched.load(Ordering::Relaxed) != NOT_WATCHED && !whole_ranges() {
-            #[cfg(test)]
-            tests::ASKED.set(tests::ASKED.get() + 1);
-            if let Some(now) = crate::watch::writes(from, to, true) {
+            let now = match polled {
+                Some(now) => Some(now),
+                None => {
+                    #[cfg(test)]
+                    tests::ASKED.set(tests::ASKED.get() + 1);
+                    crate::watch::writes(from, to, true)
+                }
+            };
+            if let Some(now) = now {
                 self.watched.store(1, Ordering::Relaxed);
                 let copied: usize = gaps.iter().map(|&(a, b)| self.copy_stale(a, b, now)).sum();
                 #[cfg(feature = "diagnostics")]
