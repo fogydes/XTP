@@ -2097,7 +2097,12 @@ impl State {
         let mut video_left = video_room(video);
         let mut spent = 0;
         for &(index, write) in &pass.due {
-            if spent >= budget || pass_time_spent(started, making) {
+            // With the host's commit too low for new staging buffers, no
+            // host texture is made for them either (`host::commit`).
+            if spent >= budget
+                || pass_time_spent(started, making)
+                || !crate::host::commit::admits_staging()
+            {
                 break;
             }
             counts.looked += 1;
