@@ -1047,13 +1047,16 @@ struct Due {
     seen_writes: u64,
     /// Per host copy (held, so that no other takes its address), its runs
     /// as last given, and those of its unordered views as last declared.
-    reads: HashMap<usize, (Arc<Shadow>, BTreeMap<u64, u64>)>,
-    writes: HashMap<usize, (Arc<Shadow>, BTreeMap<u64, u64>)>,
+    reads: RunsByCopy,
+    writes: RunsByCopy,
     /// What `submission` was given, for what its GPU work touches
     /// ([`Listing::touches`]): title ranges refreshed, runs declared.
     given_reads: Vec<(usize, usize)>,
     given_writes: Vec<Span>,
 }
+
+/// Ordered by host copy address, then run start, as the submission consumes them.
+type RunsByCopy = BTreeMap<usize, (Arc<Shadow>, BTreeMap<u64, u64>)>;
 
 impl Due {
     /// Catches `memo` up on the runs `listing` lists now for each copy
@@ -1062,7 +1065,7 @@ impl Due {
     /// go into `out` unless everything is due anyway (`all`).
     fn catch_up(
         listing: &mut Listing,
-        memo: &mut HashMap<usize, (Arc<Shadow>, BTreeMap<u64, u64>)>,
+        memo: &mut RunsByCopy,
         seen: u64,
         writes: bool,
         all: bool,
@@ -1088,7 +1091,7 @@ impl Due {
     }
 
     /// Every run of `memo`.
-    fn every(memo: &HashMap<usize, (Arc<Shadow>, BTreeMap<u64, u64>)>) -> Vec<Span> {
+    fn every(memo: &RunsByCopy) -> Vec<Span> {
         memo.values()
             .flat_map(|(copy, runs)| runs.iter().map(|(&from, &to)| (copy.clone(), from, to)))
             .collect()
@@ -1316,6 +1319,10 @@ impl Listing {
             }
             due.written = written;
         }
+        let order = |(copy, from, _): &Span| (Arc::as_ptr(copy) as usize, *from);
+        if !all {
+            reads.sort_unstable_by_key(order);
+        }
         let mut writes = Vec::new();
         if writing {
             let all = !due.declared;
@@ -1331,10 +1338,9 @@ impl Listing {
             if all {
                 writes = Due::every(&due.writes);
                 due.declared = true;
+            } else {
+                writes.sort_unstable_by_key(order);
             }
-        }
-        for spans in [&mut reads, &mut writes] {
-            spans.sort_unstable_by_key(|(copy, from, _)| (Arc::as_ptr(copy) as usize, *from));
         }
         due.given_reads.extend(
             reads
@@ -8121,6 +8127,53 @@ void main() {
         let held = heap.listed.listing().due.reads.len();
         assert_eq!(held, N, "the copy no view reads is not held");
         RUN_TIME_VIEWS_TEST.set(None);
+    }
+
+    #[test]
+    fn full_and_incremental_refreshes_order_runs_by_copy_then_address() {
+        use crate::testgpu::TitleBuffer;
+        let Some(_gpu) = crate::testgpu::device("descriptor::host::tests::ordered_runs") else {
+            return;
+        };
+        let buffers = [TitleBuffer::new(32768), TitleBuffer::new(32768)];
+        let mut copies = buffers.each_ref().map(|b| (b.shadow(), b.address()));
+        copies.sort_by_key(|(copy, _)| Arc::as_ptr(copy) as usize);
+        let mut listing = Listing::default();
+        let add = |listing: &mut Listing, offset| {
+            for (copy, base) in copies.iter().rev() {
+                let from = base + offset;
+                listing.add(
+                    copy,
+                    &Read {
+                        copy: Arc::as_ptr(copy) as usize,
+                        from,
+                        to: from + 16,
+                        unordered: true,
+                    },
+                );
+            }
+        };
+        let check = |(reads, writes): (Vec<Span>, Vec<Span>), offsets: &[u64]| {
+            let mut expected = Vec::new();
+            for (copy, base) in &copies {
+                for offset in offsets {
+                    expected.push((Arc::as_ptr(copy), base + offset, base + offset + 16));
+                }
+            }
+            for spans in [reads, writes] {
+                let actual: Vec<_> = spans
+                    .iter()
+                    .map(|(c, a, b)| (Arc::as_ptr(c), *a, *b))
+                    .collect();
+                assert_eq!(actual, expected);
+            }
+        };
+        let apart = 2 * RUN_GAP;
+        add(&mut listing, apart);
+        check(listing.due(1, 0, true), &[apart]);
+        add(&mut listing, 0);
+        check(listing.due(1, 0, true), &[0]);
+        check(listing.due(2, 0, true), &[0, apart]);
     }
 
     /// Codex review of 8612e27, P2: N disjoint views of one host copy, each
