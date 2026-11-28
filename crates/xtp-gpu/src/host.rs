@@ -4016,10 +4016,106 @@ struct Presenter {
     copy: HostList,
     hwnd: HWND,
     meter: Meter,
+    /// Tearing swap-chain and present state (latched off on refusal; swap-chain
+    /// creation flags stay fixed for `ResizeBuffers`).
+    present_mode: PresentMode,
     /// With frames in flight (diagnostics builds): the readback buffer of
     /// the last frame's black-frame probe, read once that frame finished.
     #[cfg(feature = "diagnostics")]
     probe: Option<ID3D12Resource>,
+}
+
+/// Swap-chain tearing capability and one-way present fallback state.
+struct PresentMode {
+    /// Whether the swap chain was created with `DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING`.
+    /// Must remain unchanged across `ResizeBuffers`.
+    swap_chain_tearing: bool,
+    /// Whether `Present(0, ...)` passes `DXGI_PRESENT_ALLOW_TEARING`; latched
+    /// off for the remainder of the run if a tearing present is refused.
+    presents_tearing: bool,
+    /// Whether a non-tearing present failure has already been logged.
+    present_refused: bool,
+}
+
+impl PresentMode {
+    fn new(tearing: bool) -> Self {
+        Self {
+            swap_chain_tearing: tearing,
+            presents_tearing: tearing,
+            present_refused: false,
+        }
+    }
+
+    fn swap_chain_flags(&self) -> DXGI_SWAP_CHAIN_FLAG {
+        if self.swap_chain_tearing {
+            DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING
+        } else {
+            DXGI_SWAP_CHAIN_FLAG(0)
+        }
+    }
+
+    fn present(
+        &mut self,
+        frame: u64,
+        mut call: impl FnMut(DXGI_PRESENT) -> windows::core::HRESULT,
+    ) -> windows::core::HRESULT {
+        let flags = if self.presents_tearing {
+            DXGI_PRESENT_ALLOW_TEARING
+        } else {
+            DXGI_PRESENT(0)
+        };
+        let shown = call(flags);
+        if shown.is_err() && self.presents_tearing {
+            tracing::warn!(
+                code = %shown,
+                frame,
+                "tearing present refused; falling back to non-tearing presents for the rest of the run"
+            );
+            self.presents_tearing = false;
+            let fallback = call(DXGI_PRESENT(0));
+            if fallback.is_err() && !self.present_refused {
+                self.present_refused = true;
+                tracing::warn!(code = %fallback, frame, "present refused (logged once)");
+            }
+            return fallback;
+        }
+        if shown.is_err() && !self.present_refused {
+            self.present_refused = true;
+            tracing::warn!(code = %shown, frame, "present refused (logged once)");
+        }
+        shown
+    }
+}
+
+fn tearing_enabled(env: Option<&str>) -> bool {
+    env.is_none_or(|v| v.trim() != "0")
+}
+
+/// Whether DXGI allows tearing presents on `factory` (`DXGI_FEATURE_PRESENT_ALLOW_TEARING`).
+fn query_tearing_support(factory: &IDXGIFactory2) -> bool {
+    let Ok(factory) = factory.cast::<IDXGIFactory5>() else {
+        return false;
+    };
+    let mut allowed = windows::core::BOOL(0);
+    // SAFETY: `CheckFeatureSupport` writes a `BOOL`-sized value for
+    // `DXGI_FEATURE_PRESENT_ALLOW_TEARING`.
+    let asked = unsafe {
+        factory.CheckFeatureSupport(
+            DXGI_FEATURE_PRESENT_ALLOW_TEARING,
+            (&raw mut allowed).cast(),
+            size_of_val(&allowed) as u32,
+        )
+    };
+    asked.is_ok() && allowed.as_bool()
+}
+
+/// Whether the swap chain should allow tearing presents (`XTP_TEARING=0`: off).
+/// Without it, a focused independent-flip window with two buffers waits for the
+/// next display refresh on each present, rounding frame times up to whole
+/// refreshes. On variable-refresh displays nothing tears; on fixed-refresh
+/// displays frames show as soon as presented.
+fn tearing(factory: &IDXGIFactory2) -> bool {
+    tearing_enabled(std::env::var("XTP_TEARING").ok().as_deref()) && query_tearing_support(factory)
 }
 
 /// How often the frame-rate line is logged: every 5 s, or every
@@ -4324,8 +4420,13 @@ impl Host {
             self.drain();
             // SAFETY: no back buffer is held; every submission has finished.
             let resized = unsafe {
-                p.swap_chain
-                    .ResizeBuffers(BUFFERS, width, height, format, DXGI_SWAP_CHAIN_FLAG(0))
+                p.swap_chain.ResizeBuffers(
+                    BUFFERS,
+                    width,
+                    height,
+                    format,
+                    p.present_mode.swap_chain_flags(),
+                )
             };
             match resized {
                 Ok(()) => (p.width, p.height, p.format) = (width, height, format),
@@ -4381,7 +4482,9 @@ impl Host {
             // XTP_SHADER_LOOP_COUNT: the frame's stopped lanes, once its
             // submissions have finished.
             crate::loopstat::presented(self, frame);
-            let _ = p.swap_chain.Present(0, DXGI_PRESENT(0));
+            let _ = p
+                .present_mode
+                .present(frame, |flags| p.swap_chain.Present(0, flags));
             // A captured frame is finished, to be read back; its probe is
             // still read at the next present, as every probe with frames
             // in flight (each frame reported once, one present late).
@@ -4420,6 +4523,11 @@ impl Host {
         // SAFETY: plain object creation for our window.
         unsafe {
             let factory: IDXGIFactory2 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0))?;
+            let present_mode = PresentMode::new(tearing(&factory));
+            tracing::info!(
+                tearing = present_mode.swap_chain_tearing,
+                "swap chain: allow tearing presents when supported (XTP_TEARING=0: off)"
+            );
             let desc = DXGI_SWAP_CHAIN_DESC1 {
                 Width: width,
                 Height: height,
@@ -4431,6 +4539,7 @@ impl Host {
                 BufferUsage: DXGI_USAGE_RENDER_TARGET_OUTPUT,
                 BufferCount: BUFFERS,
                 SwapEffect: DXGI_SWAP_EFFECT_FLIP_DISCARD,
+                Flags: present_mode.swap_chain_flags().0 as u32,
                 ..Default::default()
             };
             let swap_chain = factory
@@ -4447,6 +4556,7 @@ impl Host {
                 copy,
                 hwnd,
                 meter: Meter::new(),
+                present_mode,
                 #[cfg(feature = "diagnostics")]
                 probe: None,
             })
@@ -4842,5 +4952,81 @@ mod batch {
             SIZE >> 20,
             before.as_secs_f64() / after.as_secs_f64()
         );
+    }
+
+    #[test]
+    fn tearing_env_parses_opt_out() {
+        assert!(super::tearing_enabled(None));
+        assert!(super::tearing_enabled(Some("1")));
+        assert!(super::tearing_enabled(Some("")));
+        assert!(!super::tearing_enabled(Some("0")));
+        assert!(!super::tearing_enabled(Some(" 0 ")));
+    }
+
+    #[test]
+    fn tearing_present_falls_back_once_and_preserves_resize_flags() {
+        use windows::Win32::Graphics::Dxgi::{
+            DXGI_ERROR_INVALID_CALL, DXGI_PRESENT, DXGI_PRESENT_ALLOW_TEARING,
+            DXGI_SWAP_CHAIN_FLAG, DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING,
+        };
+        use windows::core::HRESULT;
+
+        let ok = HRESULT(0);
+        let mut mode = super::PresentMode::new(true);
+        assert_eq!(mode.swap_chain_flags(), DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING);
+
+        let mut calls = Vec::new();
+        assert_eq!(
+            mode.present(1, |flags| {
+                calls.push(flags);
+                ok
+            }),
+            ok
+        );
+        assert_eq!(calls, [DXGI_PRESENT_ALLOW_TEARING]);
+
+        // First refused tearing present retries immediately with 0 flags and latches off.
+        calls.clear();
+        assert_eq!(
+            mode.present(2, |flags| {
+                calls.push(flags);
+                if flags == DXGI_PRESENT_ALLOW_TEARING {
+                    DXGI_ERROR_INVALID_CALL
+                } else {
+                    ok
+                }
+            }),
+            ok
+        );
+        assert_eq!(calls, [DXGI_PRESENT_ALLOW_TEARING, DXGI_PRESENT(0)]);
+        assert!(!mode.presents_tearing);
+        // ResizeBuffers must keep the original swap-chain creation flags.
+        assert_eq!(mode.swap_chain_flags(), DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING);
+
+        // Subsequent presents stay on non-tearing mode without retrying tearing.
+        calls.clear();
+        assert_eq!(
+            mode.present(3, |flags| {
+                calls.push(flags);
+                ok
+            }),
+            ok
+        );
+        assert_eq!(calls, [DXGI_PRESENT(0)]);
+
+        let disabled = super::PresentMode::new(false);
+        assert_eq!(disabled.swap_chain_flags(), DXGI_SWAP_CHAIN_FLAG(0));
+        assert!(!disabled.presents_tearing);
+    }
+
+    #[test]
+    fn dxgi_factory_tearing_query_runs_cleanly() {
+        use windows::Win32::Graphics::Dxgi::{
+            CreateDXGIFactory2, DXGI_CREATE_FACTORY_FLAGS, IDXGIFactory2,
+        };
+        // SAFETY: plain DXGI factory creation.
+        let factory: IDXGIFactory2 =
+            unsafe { CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)) }.unwrap();
+        let _ = super::query_tearing_support(&factory);
     }
 }
