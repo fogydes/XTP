@@ -91,6 +91,7 @@ struct Settings {
     lamps: f32,
     cut: f32,
     floor: f32,
+    min_light: f32,
     specular: Option<(f32, f32)>,
 }
 
@@ -108,6 +109,7 @@ impl Settings {
             lamps: number("XTP_AMBIENT_LAMPS"),
             cut: number("XTP_AMBIENT_CUT").max(1.0).ln(),
             floor: number("XTP_AMBIENT_FLOOR"),
+            min_light: number("XTP_AMBIENT_MIN"),
             specular: get("XTP_AMBIENT_SPECULAR").and_then(|value| {
                 let mut parts = value.split(',');
                 let share = positive(parts.next()?)?;
@@ -515,6 +517,7 @@ impl Passes {
             settings.lamps.to_bits(),
             settings.cut.to_bits(),
             settings.floor.to_bits(),
+            settings.min_light.to_bits(),
         ];
         list.keep(&bound.image.resource);
         if let Some(depth) = &bound.depth {

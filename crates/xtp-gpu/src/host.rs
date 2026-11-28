@@ -3768,7 +3768,7 @@ impl HostList {
                     }
                     batch.settle(src, len, false);
                     batch.settle(dst, len, true);
-                    batch.title_written();
+                    batch.title_written_at(dst, len);
                     let _copy = Phase::Copies.enter();
                     copy_mapped(dst as *mut u8, src as *const u8, len, true);
                     moved(Moved::CpuCopy, len);
@@ -3818,7 +3818,7 @@ impl HostList {
                         Step::Run(_, (to, written), (from, read)) => {
                             batch.settle(from, read, false);
                             batch.settle(to, written, true);
-                            batch.title_written();
+                            batch.title_written_at(to, written);
                             Kind::Run
                         }
                         Step::Host(_, (from, read)) => {
@@ -3902,7 +3902,8 @@ impl HostList {
                 // submission (nothing if a list before gave it all, and
                 // nothing has changed since).
                 Step::Picked(step) => {
-                    let (reads, writes) = step.due(batch.submission, batch.title_writes);
+                    let (reads, writes) =
+                        step.due_ranges(batch.submission, &batch.title_write_ranges);
                     for (shadow, from, to) in &reads {
                         let (address, len) = (*from as usize, (to - from) as usize);
                         #[cfg(feature = "diagnostics")]
@@ -3960,8 +3961,10 @@ struct Batch<'a> {
     /// The submission's number in the host copies (`shadow::submission`).
     submission: u64,
     /// Steps that wrote title memory so far ([`Batch::title_written`]):
-    /// what was refreshed before one is refreshed again after it.
+    /// what was refreshed before one is refreshed again after it, and the
+    /// title address ranges `[from, to)` written at each such step.
     title_writes: u64,
+    title_write_ranges: Vec<(usize, usize)>,
 }
 
 impl Batch<'_> {
@@ -4147,6 +4150,15 @@ impl Batch<'_> {
         self.flush();
         self.textures.clear();
         self.title_writes += 1;
+    }
+
+    /// Like [`Batch::title_written`], recording `[address, address + len)`
+    /// so later [`Step::Picked`] steps in the same submission re-refresh
+    /// only picked runs touched by that write.
+    fn title_written_at(&mut self, address: usize, len: usize) {
+        self.title_written();
+        self.title_write_ranges
+            .push((address, address.saturating_add(len)));
     }
 
     fn flush_before_copy(

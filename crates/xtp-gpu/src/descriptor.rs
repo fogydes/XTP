@@ -692,9 +692,13 @@ pub(crate) struct SyncedHeaps(Option<u64>);
 /// Starts a [`sync_heaps`] round for a submission: off-thread on
 /// `xtp-heap-sync` when `XTP_HEAP_SYNC_ASIDE` is on (the default), inline
 /// when `XTP_HEAP_SYNC_ASIDE=0`, or a no-op when `XTP_HEAP_SYNC` is off.
+///
+/// Scans placed heaps first in scan-only mode (`sync_heaps(true)`); if no
+/// placed heap has changed or pending records to mirror, skips draining
+/// in-flight GPU work and starts no mirroring round.
 #[cfg(windows)]
 pub(crate) fn begin_sync_heaps(before_mirroring: impl FnOnce()) -> SyncedHeaps {
-    if !heap_sync().get() {
+    if !heap_sync().get() || !sync_heaps(true) {
         return SyncedHeaps(None);
     }
     before_mirroring();
@@ -866,7 +870,7 @@ static BEFORE_LOOK: std::sync::Mutex<Option<BeforeLook>> = std::sync::Mutex::new
 /// With `XTP_HEAP_SYNC=1`, or `ab` in turns ([`heap_sync`]); off, nothing is
 /// looked at.
 #[cfg(windows)]
-fn sync_heaps(scan_only: bool) {
+fn sync_heaps(scan_only: bool) -> bool {
     let started = std::time::Instant::now();
     // Held, not the registry's lock: a heap's release waits for its look,
     // and a heap made since at the same address is another.
@@ -880,6 +884,7 @@ fn sync_heaps(scan_only: bool) {
     #[cfg(not(test))]
     let holds = registered(|_| true);
     let mut found = Copies::default();
+    let mut any_pending = false;
     for (_, hold) in holds {
         hold.with(|heap| {
             #[cfg(test)]
@@ -897,12 +902,15 @@ fn sync_heaps(scan_only: bool) {
                     (hook.pause)();
                 }
             }
-            heap.look_for_copies(&mut found, scan_only);
+            if heap.look_for_copies(&mut found, scan_only) {
+                any_pending = true;
+            }
         });
     }
     let mut synced = SYNCED.lock().unwrap_or_else(|e| e.into_inner());
     synced.0.add(&found);
     synced.1 += started.elapsed().as_micros() as u64;
+    any_pending
 }
 
 /// The slots of a heap of `count` slots of `step` bytes from `start` that
@@ -1087,11 +1095,11 @@ impl Heap {
     /// memory and has its host heap: the records copied in as bytes since
     /// the last look mirrored in parallel across the sync worker pool, and
     /// what it found added to `found`.
-    fn look_for_copies(&self, found: &mut Copies, scan_only: bool) {
+    fn look_for_copies(&self, found: &mut Copies, scan_only: bool) -> bool {
         let (Some(watch), Some(Some(host)), Some(step)) =
             (&self.watched, self.host.get(), increment(self.desc.kind))
         else {
-            return;
+            return false;
         };
         let step = step as usize;
         let start = self.start as usize;
@@ -1140,13 +1148,14 @@ impl Heap {
         }
         if scan_only {
             w.pending.extend(changed);
-            return;
+            return !w.pending.is_empty();
         }
         if !w.pending.is_empty() {
             let mut pending = std::mem::take(&mut w.pending);
             pending.extend(changed);
             changed = pending.into_iter().collect();
         }
+        let has_changes = !changed.is_empty();
         let mirror_parts: Vec<std::sync::Mutex<Copies>> = changed
             .chunks(SYNC_AT_A_TIME)
             .map(|_| Default::default())
@@ -1181,6 +1190,7 @@ impl Heap {
         for part in mirror_parts {
             found.add(&part.into_inner().unwrap_or_else(|e| e.into_inner()));
         }
+        has_changes
     }
 }
 
@@ -3353,6 +3363,20 @@ mod tests {
         }
         let synced = begin_sync_heaps(|| panic!("disabled sync must not drain"));
         assert!(synced.0.is_none());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn sync_heaps_scan_only_returns_false_when_nothing_is_pending() {
+        if !LOOKED_AT_BY_TESTS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_empty()
+        {
+            return;
+        }
+        let _drain = sync_heaps(false);
+        assert!(!sync_heaps(true));
     }
 
     #[cfg(windows)]

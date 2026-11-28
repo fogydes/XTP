@@ -28,8 +28,15 @@ fn cut_and_floor_settings() {
     for ratio in ["0.5", "1.0"] {
         assert_eq!(settings_with(&[("XTP_AMBIENT_CUT", ratio)]).cut, 0.0);
     }
-    let settings = settings_with(&[("XTP_AMBIENT_CUT", " 4 "), ("XTP_AMBIENT_FLOOR", "0.75")]);
-    assert_eq!((settings.cut, settings.floor), (4.0_f32.ln(), 0.75));
+    let settings = settings_with(&[
+        ("XTP_AMBIENT_CUT", " 4 "),
+        ("XTP_AMBIENT_FLOOR", "0.75"),
+        ("XTP_AMBIENT_MIN", "0.12"),
+    ]);
+    assert_eq!(
+        (settings.cut, settings.floor, settings.min_light),
+        (4.0_f32.ln(), 0.75, 0.12)
+    );
     assert!(!settings.runs(Role::Resolve));
 }
 
@@ -677,6 +684,51 @@ fn floor_lifts_black_samples_relative_to_slow_luminance() {
     assert!((gray(bright.word(64, 36, 0)) - 1.0).abs() < 0.005);
     assert!((gray(baseline.word(64, 36, 0)) - 0.192).abs() < 0.005);
     assert!((gray(lifted.word(64, 36, 0)) - 0.75 * slow * 0.5).abs() < 0.005);
+}
+
+#[test]
+fn min_light_lifts_dark_estimate_without_affecting_bright_scenes() {
+    let Some(gpu) = testgpu::device("ambient min_light") else {
+        return;
+    };
+    let settings = settings_with(&[
+        ("XTP_AMBIENT", "1.0"),
+        ("XTP_AMBIENT_CUT", "2"),
+        ("XTP_AMBIENT_MIN", "0.15"),
+    ]);
+    let passes = Passes::make(&gpu.device, settings).unwrap();
+    let scene = Scene::new(&gpu.device);
+    let list = gpu.new_list().unwrap();
+    scene.prepare(&list);
+    let keep = scene.bound(Role::Radiance);
+
+    scene.clear_radiance(&list, 0.0, &[]);
+    assert!(passes.record(&list, settings, &keep));
+    let baseline = scene.resolve_light(
+        &gpu,
+        &list,
+        &passes,
+        Settings {
+            min_light: 0.0,
+            ..settings
+        },
+    );
+    let lifted = scene.resolve_light(&gpu, &list, &passes, settings);
+
+    scene.clear_radiance(&list, 2.0, &[]);
+    assert!(passes.record(&list, settings, &keep));
+    let bright = scene.resolve_light(&gpu, &list, &passes, settings);
+    list.close();
+    gpu.execute(&[&list]);
+    gpu.drain();
+
+    assert!(gray(baseline.word(64, 36, 0)) < 0.01);
+    let actual = gray(lifted.word(64, 36, 0));
+    assert!(
+        (actual - 0.15).abs() < 0.01,
+        "expected min_light floor near 0.15, got {actual}"
+    );
+    assert!((gray(bright.word(64, 36, 0)) - 2.0).abs() < 0.01);
 }
 
 #[test]
