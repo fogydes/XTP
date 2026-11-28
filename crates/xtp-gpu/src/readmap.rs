@@ -318,7 +318,7 @@ impl Owners {
         // A title write made before the guards went on wins. A common
         // uncontended piece needs only a wide comparison and one copy.
         if let Some(before) = before
-            && page != before
+            && crate::compare::differ(page, before)
         {
             for ((gpu, title), old) in gpu.iter_mut().zip(page.iter()).zip(before) {
                 if title != old {
