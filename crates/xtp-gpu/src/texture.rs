@@ -1175,6 +1175,37 @@ fn refused(bytes: u64, share: u64, made: u64, limit: u64, staged: u64) -> Staged
     }
 }
 
+/// Uploads staged textures that hold an upload buffer yet have no host copy
+/// populated (`copied` is `None`), typically from earlier unsubmitted title
+/// lists, onto `list` ahead of a synchronous bake pass. Returns the resources
+/// whose uploads were recorded.
+pub(crate) fn flush_unsubmitted_to_bake(list: &HostList) -> Vec<This> {
+    let candidates: Vec<This> = {
+        let map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(map) = map.as_ref() else {
+            return Vec::new();
+        };
+        map.iter()
+            .filter_map(|(&resource, s)| {
+                let has_upload = s.upload.lock().unwrap_or_else(|e| e.into_inner()).is_some();
+                let not_copied = s.copied.lock().unwrap_or_else(|e| e.into_inner()).is_none();
+                (!s.host_owned.load(Ordering::Relaxed) && has_upload && not_copied)
+                    .then_some(resource as This)
+            })
+            .collect()
+    };
+    let mut uploaded = Vec::new();
+    for resource in candidates {
+        if let Some(t) = crate::resource::host_resource(resource)
+            && title_written(t)
+            && upload(list, resource, t)
+        {
+            uploaded.push(resource);
+        }
+    }
+    uploaded
+}
+
 /// Releases `resource`'s staging buffer at once if no list holds it,
 /// whatever uploads were recorded lately (tests elsewhere: other tests'
 /// textures are left as they are); whether it went.
