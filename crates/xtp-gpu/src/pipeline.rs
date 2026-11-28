@@ -857,6 +857,8 @@ mod make;
 pub mod precook;
 #[cfg(windows)]
 mod record;
+#[cfg(windows)]
+pub(crate) mod samplers;
 
 /// Keeps compiled host pipelines, and the list of title pipelines to start
 /// early, in `dir` (a folder of the cache) across runs.

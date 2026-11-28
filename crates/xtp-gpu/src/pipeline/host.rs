@@ -1193,6 +1193,9 @@ impl HostPipeline {
                 ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
             });
         }
+        // Give any static samplers their deterministic driver-table slots before
+        // creating a root signature that references them (`samplers`).
+        super::samplers::before(&host.device, &samplers);
         let (root, root_blob) =
             match root_signature(&host.device, &params, &samplers, compute.is_some()) {
                 Ok(root) => root,

@@ -548,6 +548,9 @@ fn create(software: bool) -> windows::core::Result<Host> {
             crate::tdr::log();
         }
         let device = device.ok_or_else(windows::core::Error::empty)?;
+        // Prime previously recorded static samplers before any root signature
+        // with static samplers is created on this device.
+        crate::pipeline::samplers::prime(&device);
         let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS2::default();
         let depth_bounds = device
             .CheckFeatureSupport(
