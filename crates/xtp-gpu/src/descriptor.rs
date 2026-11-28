@@ -1155,9 +1155,11 @@ impl Heap {
             let mut local = Copies::default();
             for &(index, key) in changed.chunks(SYNC_AT_A_TIME).nth(n).unwrap_or_default() {
                 let made = host.made_key(index);
-                let kind = host
-                    .mirror_copied(index, key, &watch.noted[index as usize])
-                    .unwrap_or(host::CopiedKind::Other);
+                let Some(kind) = host.mirror_copied(index, key, &watch.noted[index as usize])
+                else {
+                    // Superseded by a newer API write before mirroring ran.
+                    continue;
+                };
                 // In the frames listed for capture: each record mirrored,
                 // what its host slot was made from before, and its view.
                 #[cfg(feature = "diagnostics")]
@@ -3235,7 +3237,10 @@ mod tests {
             (0, 0),
             "{during:?} {after:?}"
         );
-        // A copy, then a call while the look reads: the copy counted once.
+        // A copy, then a call while the look reads: the copy is mirrored at
+        // most once (skipped if the call already superseded it before
+        // mirroring), never misclassified as Other, and the call is never
+        // counted at the next look or lost.
         let source = [0u64; 4];
         create_srv(
             std::ptr::null(),
@@ -3246,9 +3251,8 @@ mod tests {
         store_record(title, &source, 7);
         let during = look_while_called(0x1688);
         let after = look(title);
-        assert_eq!(
-            (during.copied, after.copied),
-            (1, 0),
+        assert!(
+            during.copied <= 1 && during.other == 0 && after.copied == 0,
             "{during:?} {after:?}"
         );
         assert_eq!(
@@ -3444,7 +3448,10 @@ mod tests {
         create_srv(std::ptr::null(), tex, &rewrite, at);
         let newer = record_key(header(at));
         assert_ne!(newer, key);
-        assert_eq!(look(title).copied, 2);
+        let found = look(title);
+        assert_eq!(found.copied, 1);
+        assert_eq!(found.other, 0);
+        assert_eq!(found.unmade, 1);
         assert_eq!(host.made_keys(&[3, 4]), [key, newer]);
 
         // A prior table read does not let a copied CBV keep the old texture.
