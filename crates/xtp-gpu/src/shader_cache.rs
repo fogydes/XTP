@@ -161,6 +161,9 @@ fn announce(s: &xtp_shader::emit::Settings) {
     if s.loop_count {
         tracing::info!("XTP_SHADER_LOOP_COUNT: translated loops count the lanes they stop");
     }
+    if !s.water_tile_slots {
+        tracing::info!("XTP_WATER_TILE_SLOTS=0: wave32 per-lane tile-list rewrites disabled");
+    }
 }
 
 /// This file: how entries are encoded and decoded, and which translation
@@ -190,6 +193,7 @@ fn build_of(translator: &[u8; 32], settings: &xtp_shader::emit::Settings) -> [u8
         dxil_opt,
         raw_structured,
         loop_count,
+        water_tile_slots,
     } = *settings;
     let mut h = blake3::Hasher::new();
     h.update(translator);
@@ -201,6 +205,7 @@ fn build_of(translator: &[u8; 32], settings: &xtp_shader::emit::Settings) -> [u8
         ("dxil opt", dxil_opt),
         ("raw structured", u32::from(raw_structured)),
         ("loop count", u32::from(loop_count)),
+        ("water tile slots", u32::from(water_tile_slots)),
     ] {
         h.update(&(name.len() as u64).to_le_bytes());
         h.update(name.as_bytes());
@@ -1305,6 +1310,11 @@ mod tests {
     #[test]
     fn the_loop_limit_counter_is_in_the_key() {
         a_changed_setting_is_rejected(|s| s.loop_count = !s.loop_count);
+    }
+
+    #[test]
+    fn the_water_tile_slots_switch_is_in_the_key() {
+        a_changed_setting_is_rejected(|s| s.water_tile_slots = !s.water_tile_slots);
     }
 
     #[test]

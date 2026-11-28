@@ -163,6 +163,7 @@ pub fn run(
     host_lanes: Option<(u32, u32)>,
 ) -> Result<()> {
     let paths = crate::default_paths(paths)?;
+    xtp_game::water_tile_slots::configure();
     let dll = validate.then(Validator::default_path).flatten();
     if validate {
         Validator::load(dll.as_deref()).map_err(anyhow::Error::msg)?;
@@ -341,10 +342,13 @@ fn translate(
         t.duplicates += 1;
         return;
     }
-    let programs = match native_programs(dxil) {
+    let mut programs = match native_programs(dxil) {
         Ok(p) => p,
         Err(e) => return t.fail(e.to_string(), example),
     };
+    for p in &mut programs {
+        emit::host_form(&container, p, checks.target);
+    }
     for p in programs {
         t.programs += 1;
         match ir::build(&p.patched_code(), p.wave64, p.vgprs) {

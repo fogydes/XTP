@@ -848,6 +848,7 @@ dependencies = [
  "xtp-core",
  "xtp-gpu",
  "xtp-pe",
+ "xtp-shader",
 ]
 
 [[package]]

@@ -155,6 +155,7 @@ pub mod validator;
 mod validator_tests;
 #[cfg(all(test, windows))]
 mod valu_tests;
+pub mod water_tile_slots;
 #[cfg(all(test, windows))]
 mod waterfall_tests;
 mod wave;
@@ -335,6 +336,8 @@ pub struct Settings {
     pub raw_structured: bool,
     /// [`loop_count`], on this thread.
     pub loop_count: bool,
+    /// [`water_tile_slots::enabled`] (`XTP_WATER_TILE_SLOTS=0` disables wave32 per-lane rewrites).
+    pub water_tile_slots: bool,
 }
 
 /// The [`Settings`] a translation made now on this thread runs with.
@@ -347,6 +350,7 @@ pub fn settings() -> Settings {
         dxil_opt: dxil_opt(),
         raw_structured: raw_structured(),
         loop_count: loop_count(),
+        water_tile_slots: water_tile_slots::enabled(),
     }
 }
 
@@ -772,14 +776,24 @@ pub fn translate_program(
     translate_program_for(c, native, Target::ANY)
 }
 
+/// Brings a console program into the form `target` translates when a
+/// registered wave32 per-lane append rewrite applies ([`water_tile_slots`]).
+/// [`translate_program_for`] applies this automatically; callers that parse
+/// the container and decode `native` directly call this first. Returns whether
+/// `native` changed.
+pub fn host_form(c: &Container, native: &mut NativeProgram, target: Target) -> bool {
+    water_tile_slots::rewrite_program(c, native, target)
+}
+
 /// [`translate_program`] for a host that runs the wave sizes of `target`.
 pub fn translate_program_for(
     c: &Container,
     native: &NativeProgram,
     target: Target,
 ) -> Result<HostShader, (Step, ShaderError)> {
-    let p = ir::build(&native.patched_code(), native.wave64, native.vgprs)
-        .map_err(|e| (Step::Decode, e))?;
+    let mut code = native.patched_code();
+    water_tile_slots::rewrite_for_target(c, native.stage, native.wave64, &mut code, target);
+    let p = ir::build(&code, native.wave64, native.vgprs).map_err(|e| (Step::Decode, e))?;
     let p = lower::geometry::prepared(p, native.stage).map_err(|e| (Step::Decode, e))?;
     let p = lower::rayquery::prepared(p, native).map_err(|e| (Step::Decode, e))?;
     // Structurisation first: tracing per-lane descriptors needs it (its

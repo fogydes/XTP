@@ -144,6 +144,7 @@ fn precook(o: Options) -> Result<()> {
     use xtp_gpu::pipeline::precook as gpu;
 
     below_normal();
+    xtp_game::water_tile_slots::configure();
     let path = crate::survey::pack_path(o.pack.clone())?;
     if let Some(out) = &o.list {
         // Names of the title's programs stay out of the repository.

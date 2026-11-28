@@ -11,6 +11,7 @@ publish.workspace = true
 memchr.workspace = true
 miniz_oxide.workspace = true
 tracing.workspace = true
+xtp-shader.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 # The A/B clock that `rt_path` follows.

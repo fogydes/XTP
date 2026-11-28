@@ -9,6 +9,7 @@ pub mod rpf;
 pub mod rt_path;
 pub mod sgd5;
 pub mod watchdog;
+pub mod water_tile_slots;
 
 /// A specific build of the BTP 6 executable we know how to run.
 #[derive(Debug, Clone, Copy)]
