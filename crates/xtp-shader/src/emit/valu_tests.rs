@@ -1163,3 +1163,23 @@ fn v_fmac_f32_takes_the_accumulator_modifiers() {
         });
     }
 }
+
+#[test]
+fn fma_mix_to_a_half_keeps_the_other_half() {
+    // v_mov_b32 v0, v1; v_fma_mixlo_f16 (mixhi) v0, 2.0, 0.5, 1.0: the f16
+    // 2.0 (0x4000) in the low (high) half, the other half of v1 kept.
+    const TWO: u32 = 244;
+    const HALF: u32 = 240;
+    const ONE: u32 = 242;
+    for (op, want) in [(0x21, 0xAAAA_4000), (0x22, 0x4000_BBBB)] {
+        let body = [
+            vop1(0x001, 0, vgpr(1)),
+            0x33 << 26 | op << 16,
+            ONE << 18 | HALF << 9 | TWO,
+        ];
+        let shader = build_valu_cs(&body);
+        run_cases(&shader, &[[0xAAAA_BBBB, 0, 0, 0]], |backend, _, _, got| {
+            assert_eq!(got, want, "{backend}: VOP3P op {op:#x}: {got:#010x}");
+        });
+    }
+}
