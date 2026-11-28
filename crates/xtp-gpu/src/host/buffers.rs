@@ -585,6 +585,8 @@ impl Pool {
     /// [`RESERVE`] free or a thread waits for room, and releases empty
     /// heaps past one heap's worth of spare room.
     fn reserve(&self) {
+        let name = format!("xtp-gpu-{:?}-buffers", self.kind).to_lowercase();
+        crate::cores::keep_helper_on_fast_cores(&name);
         loop {
             let surplus = {
                 let mut s = self.lock();

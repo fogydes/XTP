@@ -2207,6 +2207,7 @@ impl Host {
     /// A panic in it ends the run: the thread would be gone, and the title
     /// would wait for its fences for ever.
     fn finish_loop(&self) {
+        crate::cores::keep_on_fast_cores("xtp-gpu-finisher");
         FINISHER.set(true);
         loop {
             let finished = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {

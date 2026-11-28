@@ -689,7 +689,11 @@ impl Pools {
                         CHEAP => format!("xtp-pipelines-{i}"),
                         _ => format!("xtp-pipelines-heavy-{i}"),
                     };
-                    let spawned = worker(name).spawn(move || self.work(pool));
+                    let worker_name = name.clone();
+                    let spawned = worker(name).spawn(move || {
+                        crate::cores::keep_many_on_fast_cores(&worker_name);
+                        self.work(pool);
+                    });
                     if let Err(e) = &spawned {
                         tracing::warn!(error = %e, pool = POOL_NAMES[pool], "no pipeline worker");
                     }

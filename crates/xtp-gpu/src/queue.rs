@@ -833,6 +833,7 @@ fn watch() {
         let spawned = std::thread::Builder::new()
             .name("xtp-gpu-queue-waits".into())
             .spawn(|| {
+                crate::cores::keep_on_fast_cores("xtp-gpu-queue-waits");
                 loop {
                     let holding = !lock(&WAITING).is_empty();
                     let mut woken = lock(&WAKE.0);
