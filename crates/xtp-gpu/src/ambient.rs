@@ -37,6 +37,8 @@ pub enum Role {
     Radiance,
     /// Finishes writing the in-scattering volume.
     Air,
+    /// Supplies sky light for reflection rays that missed.
+    Specular,
 }
 
 /// The table entries used by the compute programs for each role.
@@ -50,6 +52,12 @@ pub struct Layout {
     pub radiance: Binding,
     /// A 3D R11G11B10_FLOAT UAV holding in-scattered light.
     pub air: Binding,
+    /// Reflection-miss output and preferred scene depth.
+    pub specular: Binding,
+    /// The reverse-Z SRV at twice the reflection resolution.
+    pub specular_depth: Binding,
+    /// Surface layers with usable depth, selected by the first root constant.
+    pub reflection_layers: &'static [u32],
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -83,6 +91,7 @@ struct Settings {
     lamps: f32,
     cut: f32,
     floor: f32,
+    specular: Option<(f32, f32)>,
 }
 
 impl Settings {
@@ -99,14 +108,22 @@ impl Settings {
             lamps: number("XTP_AMBIENT_LAMPS"),
             cut: number("XTP_AMBIENT_CUT").max(1.0).ln(),
             floor: number("XTP_AMBIENT_FLOOR"),
+            specular: get("XTP_AMBIENT_SPECULAR").and_then(|value| {
+                let mut parts = value.split(',');
+                let share = positive(parts.next()?)?;
+                let sky = parts.next().and_then(positive).unwrap_or_default().min(1.0);
+                Some((share, sky))
+            }),
         }
     }
 
     fn runs(self, role: Role) -> bool {
-        match self.mode {
-            Mode::Off => false,
-            Mode::Constant(_) => role == Role::Resolve,
-            Mode::Estimate(_) => role != Role::Air || self.air > 0.0,
+        let estimate = matches!(self.mode, Mode::Estimate(_));
+        match role {
+            Role::Resolve => self.mode != Mode::Off,
+            Role::Air => estimate && self.air > 0.0,
+            Role::Radiance => estimate || self.specular.is_some(),
+            Role::Specular => self.specular.is_some(),
         }
     }
 
@@ -127,6 +144,7 @@ pub(crate) struct Program {
 }
 
 struct Configuration {
+    reflection_miss: Option<fn(&[u8]) -> bool>,
     settings: Settings,
     layout: Layout,
     roles: HashMap<u64, Role>,
@@ -154,6 +172,7 @@ fn override_roles(roles: &mut HashMap<u64, Role>, text: &str, mut invalid: impl 
             "resolve" => Role::Resolve,
             "radiance" => Role::Radiance,
             "air" => Role::Air,
+            "specular" => Role::Specular,
             _ => {
                 invalid(group);
                 continue;
@@ -174,11 +193,15 @@ fn override_roles(roles: &mut HashMap<u64, Role>, text: &str, mut invalid: impl 
 /// pipelines. XTP_AMBIENT_PROGRAMS adds or reassigns hashes using
 /// `resolve:<hash>,...;radiance:<hash>,...;air:<hash>,...`. Hashes are the
 /// 16 hex digits printed by the runtime. The last assignment wins.
-pub fn configure(layout: Layout, defaults: &[(&str, Role)]) {
+pub fn configure(
+    layout: Layout,
+    defaults: &[(&str, Role)],
+    reflection_miss: Option<fn(&[u8]) -> bool>,
+) {
     CONFIGURATION.get_or_init(|| {
         let settings = Settings::read(|name| std::env::var(name).ok());
         let mut roles = HashMap::new();
-        if settings.mode != Mode::Off {
+        if settings.mode != Mode::Off || settings.specular.is_some() {
             roles.extend(
                 defaults
                     .iter()
@@ -189,11 +212,11 @@ pub fn configure(layout: Layout, defaults: &[(&str, Role)]) {
                     tracing::warn!(entry, "invalid XTP_AMBIENT_PROGRAMS entry");
                 });
             }
-            if matches!(settings.mode, Mode::Estimate(_))
-                && !roles.values().any(|r| *r == Role::Radiance)
-            {
+            if settings.runs(Role::Radiance) && !roles.values().any(|r| *r == Role::Radiance) {
                 tracing::warn!("ambient estimate needs a radiance program in XTP_AMBIENT_PROGRAMS");
-                roles.clear();
+                roles.retain(|_, role| {
+                    *role == Role::Resolve && matches!(settings.mode, Mode::Constant(_))
+                });
             }
             if settings.runs(Role::Air)
                 && !roles.is_empty()
@@ -203,6 +226,9 @@ pub fn configure(layout: Layout, defaults: &[(&str, Role)]) {
             }
         }
         Configuration {
+            reflection_miss: reflection_miss.filter(|_| {
+                settings.specular.is_some() && roles.values().any(|role| *role == Role::Radiance)
+            }),
             settings,
             layout,
             roles,
@@ -211,10 +237,15 @@ pub fn configure(layout: Layout, defaults: &[(&str, Role)]) {
 }
 
 /// Looks up the first eight BLAKE3 bytes in the printed byte order.
-pub(crate) fn program(hash: &[u8; 32]) -> Option<Program> {
+pub(crate) fn program(hash: &[u8; 32], bytes: &[u8]) -> Option<Program> {
     let config = CONFIGURATION.get()?;
     let key = u64::from_be_bytes(hash[..8].try_into().ok()?);
-    let role = *config.roles.get(&key)?;
+    let role = config.roles.get(&key).copied().or_else(|| {
+        config
+            .reflection_miss
+            .is_some_and(|matches| matches(bytes))
+            .then_some(Role::Specular)
+    })?;
     config.settings.runs(role).then_some(Program {
         role,
         layout: config.layout,
@@ -245,6 +276,7 @@ struct Passes {
     gather: ID3D12PipelineState,
     raise: ID3D12PipelineState,
     air: Option<ID3D12PipelineState>,
+    reflect: Option<ID3D12PipelineState>,
     cells: ID3D12Resource,
     points: ID3D12Resource,
 }
@@ -376,15 +408,18 @@ impl Passes {
         let raise = pipeline(&raise_code)?;
         let place = make("PLACE", s!("place"))?;
         let gather = make("GATHER", s!("gather"))?;
-        let r11 = matches!(settings.mode, Mode::Estimate(_)) && r11_supported;
-        if matches!(settings.mode, Mode::Estimate(_)) && !r11 {
+        let r11 = settings.runs(Role::Radiance) && r11_supported;
+        if settings.runs(Role::Radiance) && !r11 {
             tracing::warn!("ambient estimate needs R11G11B10_FLOAT typed UAV loads");
         }
         let keep = r11
             .then(|| Ok::<_, Error>((make("KEEP", s!("keep"))?, make("KEEP", s!("mean"))?)))
             .transpose()?;
-        let air = (r11 && settings.air > 0.0)
+        let air = (r11 && settings.runs(Role::Air))
             .then(|| make("AIR", s!("clear_air")))
+            .transpose()?;
+        let reflect = (r11 && settings.runs(Role::Specular))
+            .then(|| make("REFLECT", s!("reflect_light")))
             .transpose()?;
         Ok(Self {
             root,
@@ -393,16 +428,21 @@ impl Passes {
             gather,
             raise,
             air,
+            reflect,
             cells: scratch(device, CELL_BYTES)?,
             points: scratch(device, POINT_BYTES)?,
         })
     }
 
     fn record(&self, list: &HostList, settings: Settings, bound: &Bound) -> bool {
-        let (level, constant) = match settings.mode {
-            Mode::Off => return false,
-            Mode::Estimate(level) => (level, 0.0),
-            Mode::Constant(level) => (0.0, level),
+        if !settings.runs(bound.role) {
+            return false;
+        }
+        let (level, constant) = match (bound.role, settings.mode) {
+            (Role::Specular, _) => settings.specular.unwrap_or_default(),
+            (_, Mode::Off) => (0.0, 0.0),
+            (_, Mode::Estimate(level)) => (level, 0.0),
+            (_, Mode::Constant(level)) => (0.0, level),
         };
         let [width, height, slices] = bound.size;
         let (passes, groups) = match bound.role {
@@ -441,6 +481,19 @@ impl Passes {
                         [width.div_ceil(8), height.div_ceil(8), slices.div_ceil(2)],
                         [0; 3],
                         [0; 3],
+                    ],
+                )
+            }
+            Role::Specular => {
+                let Some(reflect) = &self.reflect else {
+                    return false;
+                };
+                (
+                    [Some(&self.place), Some(&self.gather), Some(reflect)],
+                    [
+                        [8, 9, 1],
+                        [20, 45, 1],
+                        [width.div_ceil(8), height.div_ceil(8), 1],
                     ],
                 )
             }

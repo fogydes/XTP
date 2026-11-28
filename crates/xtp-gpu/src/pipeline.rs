@@ -93,7 +93,7 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
                 hash: full.to_hex()[..16].to_owned(),
                 #[cfg(windows)]
                 ambient: if stage == "compute" {
-                    crate::ambient::program(full.as_bytes())
+                    crate::ambient::program(full.as_bytes(), bytes)
                 } else {
                     None
                 },

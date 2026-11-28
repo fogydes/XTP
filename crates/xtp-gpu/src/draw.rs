@@ -2859,10 +2859,20 @@ impl State {
                 desc,
             ))
         };
+        if program.role == Role::Specular && !program.layout.reflection_layers.is_empty() {
+            let layer = self.compute.iter().find_map(|root| match root {
+                Root::Constants(words) => words.first().copied(),
+                _ => None,
+            });
+            if !layer.is_some_and(|l| program.layout.reflection_layers.contains(&l)) {
+                return Err(format!("reflection layer {layer:?} skipped"));
+            }
+        }
         let slot = match program.role {
             Role::Resolve => program.layout.light,
             Role::Radiance => program.layout.radiance,
             Role::Air => program.layout.air,
+            Role::Specular => program.layout.specular,
         };
         let (image, view_kind, desc) = entry(slot, ResourceType::Uav)?;
         let View::Unordered(_, _, words) = view_kind else {
@@ -2870,7 +2880,7 @@ impl State {
         };
         let expected = match program.role {
             Role::Resolve => DXGI_FORMAT_R32_UINT,
-            Role::Radiance | Role::Air => DXGI_FORMAT_R11G11B10_FLOAT,
+            Role::Radiance | Role::Air | Role::Specular => DXGI_FORMAT_R11G11B10_FLOAT,
         };
         let mut view = words.as_ref().map(uav_desc);
         let fit = fits(&image.resource, view.as_mut().map(|v| &mut v.Format), true);
@@ -2917,7 +2927,7 @@ impl State {
         // depth view of the light's size, else the first other shader view
         // of the dispatch's tables that is (its tables also hold a stencil
         // view of the same target in some builds).
-        let depth_at = |at: crate::ambient::Binding| -> Result<Texture, String> {
+        let depth_at = |at: crate::ambient::Binding| -> Result<(Texture, u64, u32), String> {
             let (depth, view_kind, depth_desc) = entry(at, ResourceType::Srv)?;
             let View::Shader(resource, words) = view_kind else {
                 return Err("the depth is not a shader view".to_owned());
@@ -2933,6 +2943,9 @@ impl State {
                 ));
             }
             let format = view.as_ref().map_or(depth_desc.Format, |v| v.Format);
+            let size_ok = (depth_desc.Width, depth_desc.Height) == (desc.Width, desc.Height)
+                || (program.role == Role::Specular
+                    && (depth_desc.Width, depth_desc.Height) == (desc.Width * 2, desc.Height * 2));
             if !matches!(
                 format,
                 DXGI_FORMAT_R32_FLOAT
@@ -2941,7 +2954,7 @@ impl State {
                     | DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS
             ) || depth_desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D
                 || depth_desc.DepthOrArraySize != 1
-                || (depth_desc.Width, depth_desc.Height) != (desc.Width, desc.Height)
+                || !size_ok
                 || view.is_some_and(|v| {
                     // SAFETY: the dimension check selects Texture2D.
                     v.ViewDimension != D3D12_SRV_DIMENSION_TEXTURE2D
@@ -2962,11 +2975,15 @@ impl State {
                     desc.Height
                 ));
             }
-            Ok(depth)
+            Ok((depth, depth_desc.Width, depth_desc.Height))
         };
-        let depth = if program.role == Role::Resolve {
-            let preferred = program.layout.depth;
-            let depth = match depth_at(preferred) {
+        let (depth, width, height) = if matches!(program.role, Role::Resolve | Role::Specular) {
+            let preferred = if program.role == Role::Specular {
+                program.layout.specular_depth
+            } else {
+                program.layout.depth
+            };
+            let (depth, width, height) = match depth_at(preferred) {
                 Ok(depth) => depth,
                 Err(preferred_reason) => {
                     let mut others = used
@@ -2999,18 +3016,22 @@ impl State {
                     depth
                 }
             };
-            Some(depth)
+            let size = if program.role == Role::Specular {
+                (width, height)
+            } else {
+                (desc.Width, desc.Height)
+            };
+            (Some(depth), size.0, size.1)
         } else {
-            None
+            (None, desc.Width, desc.Height)
         };
         Ok(Bound {
             role: program.role,
             image,
             depth,
             size: [
-                u32::try_from(desc.Width)
-                    .map_err(|_| format!("image width {} exceeds u32", desc.Width))?,
-                desc.Height,
+                u32::try_from(width).map_err(|_| format!("image width {width} exceeds u32"))?,
+                height,
                 u32::from(desc.DepthOrArraySize),
             ],
         })
@@ -8448,6 +8469,9 @@ float4 ps(V v) : SV_Target { return v.color; }
                 depth: (1, 8),
                 radiance: (1, 0),
                 air: (1, 0),
+                specular: (1, 0),
+                specular_depth: (1, 8),
+                reflection_layers: &[],
             },
         };
 

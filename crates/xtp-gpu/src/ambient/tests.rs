@@ -84,6 +84,7 @@ const DEPTH: usize = 0;
 const LIGHT: usize = 1;
 const RADIANCE: usize = 2;
 const AIR: usize = 3;
+const SPECULAR: usize = 5;
 
 struct Scene {
     visible: ID3D12DescriptorHeap,
@@ -93,6 +94,7 @@ struct Scene {
     light: ID3D12Resource,
     radiance: ID3D12Resource,
     air: ID3D12Resource,
+    specular: ID3D12Resource,
 }
 
 fn committed(
@@ -127,7 +129,7 @@ impl Scene {
             unsafe {
                 device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
                     Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
-                    NumDescriptors: 5,
+                    NumDescriptors: 6,
                     Flags: flags,
                     NodeMask: 0,
                 })
@@ -171,6 +173,12 @@ impl Scene {
             light: texture(DXGI_FORMAT_R32_UINT, WIDTH.into(), HEIGHT, 1),
             radiance: texture(DXGI_FORMAT_R11G11B10_FLOAT, WIDTH.into(), HEIGHT, 1),
             air: texture(DXGI_FORMAT_R11G11B10_FLOAT, 8, 8, 2),
+            specular: texture(
+                DXGI_FORMAT_R11G11B10_FLOAT,
+                (WIDTH / 2).into(),
+                HEIGHT / 2,
+                1,
+            ),
         };
         // SAFETY: whole-resource views of these single-mip textures, in the test heaps.
         unsafe {
@@ -183,6 +191,7 @@ impl Scene {
                 (LIGHT, &scene.light),
                 (RADIANCE, &scene.radiance),
                 (AIR, &scene.air),
+                (SPECULAR, &scene.specular),
                 (4, &scene.depth),
             ] {
                 for heap in [&scene.cpu, &scene.visible] {
@@ -243,12 +252,13 @@ impl Scene {
             Role::Resolve => (view(LIGHT, &self.light), [WIDTH, HEIGHT, 1]),
             Role::Radiance => (view(RADIANCE, &self.radiance), [WIDTH, HEIGHT, 1]),
             Role::Air => (view(AIR, &self.air), [8, 8, 2]),
+            Role::Specular => (view(SPECULAR, &self.specular), [WIDTH, HEIGHT, 1]),
         };
         Bound {
             role,
             image,
             size,
-            depth: (role == Role::Resolve).then(|| view(DEPTH, &self.depth)),
+            depth: matches!(role, Role::Resolve | Role::Specular).then(|| view(DEPTH, &self.depth)),
         }
     }
 
@@ -667,4 +677,53 @@ fn floor_lifts_black_samples_relative_to_slow_luminance() {
     assert!((gray(bright.word(64, 36, 0)) - 1.0).abs() < 0.005);
     assert!((gray(baseline.word(64, 36, 0)) - 0.192).abs() < 0.005);
     assert!((gray(lifted.word(64, 36, 0)) - 0.75 * slow * 0.5).abs() < 0.005);
+}
+
+#[test]
+fn specular_settings_and_sky_cap() {
+    assert_eq!(settings_with(&[]).specular, None);
+    assert_eq!(
+        settings_with(&[("XTP_AMBIENT_SPECULAR", "0")]).specular,
+        None
+    );
+    assert_eq!(
+        settings_with(&[("XTP_AMBIENT_SPECULAR", "0.8")]).specular,
+        Some((0.8, 0.0))
+    );
+    let clamped = settings_with(&[("XTP_AMBIENT_SPECULAR", "0.5, 2.0")]);
+    assert_eq!(clamped.specular, Some((0.5, 1.0)));
+    assert!(clamped.runs(Role::Radiance));
+    assert!(clamped.runs(Role::Specular));
+    assert!(!clamped.runs(Role::Resolve));
+
+    let Some(gpu) = testgpu::device("ambient specular") else {
+        return;
+    };
+    let settings = settings_with(&[("XTP_AMBIENT_SPECULAR", "0.5, 0.5")]);
+    let passes = Passes::make(&gpu.device, settings).unwrap();
+    let scene = Scene::new(&gpu.device);
+    let list = gpu.new_list().unwrap();
+    scene.prepare(&list);
+    scene.clear_radiance(&list, 2.0, &[]);
+    assert!(passes.record(&list, settings, &scene.bound(Role::Radiance)));
+    // Seed reflections with 4.0 sky light; 0.5 share of 2.0 caps it to 1.0.
+    // SAFETY: the heap is bound and the specular reflection texture is a live UAV.
+    unsafe {
+        list.list.ResourceBarrier(&[uav_barrier()]);
+        list.list.ClearUnorderedAccessViewFloat(
+            scene.gpu_at(SPECULAR),
+            scene.cpu_at(&scene.cpu, SPECULAR),
+            &scene.specular,
+            &[4.0; 4],
+            &[],
+        );
+    }
+    assert!(passes.record(&list, settings, &scene.bound(Role::Specular)));
+    let out = Readback::copy(&gpu, &list, &scene.specular);
+    list.close();
+    gpu.execute(&[&list]);
+    gpu.drain();
+
+    // R11_FLOAT value of 1.0 has exponent 15 and mantissa 0.
+    assert_eq!(out.word(16, 16, 0) & 0x7ff, 15 << 6);
 }
